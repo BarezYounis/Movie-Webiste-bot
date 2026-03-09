@@ -408,22 +408,31 @@ async def upload_part(bot, local_path: str, caption: str) -> bool:
         log.error("  Exceeds 2 GB. Skipping.")
         return False
 
-    try:
-        with open(local_path, "rb") as f:
-            await bot.send_video(
-                chat_id=CHANNEL_ID,
-                video=f,
-                caption=caption,
-                supports_streaming=True,
-                read_timeout=600,
-                write_timeout=600,
-                connect_timeout=60,
-            )
-        log.info(f"  ✅ Uploaded: {filename}")
-        return True
-    except TelegramError as e:
-        log.error(f"  Telegram error: {e}")
-        return False
+    for attempt in range(1, 4):  # 3 attempts
+        try:
+            log.info(f"  Upload attempt {attempt}/3...")
+            with open(local_path, "rb") as f:
+                await bot.send_video(
+                    chat_id=CHANNEL_ID,
+                    video=f,
+                    caption=caption,
+                    supports_streaming=True,
+                    read_timeout=3600,   # 1 hour
+                    write_timeout=3600,  # 1 hour
+                    connect_timeout=120,
+                    pool_timeout=3600,
+                )
+            log.info(f"  ✅ Uploaded: {filename}")
+            return True
+        except TelegramError as e:
+            log.error(f"  Telegram error (attempt {attempt}): {e}")
+            if attempt < 3:
+                wait = 30 * attempt
+                log.info(f"  Retrying in {wait}s...")
+                await asyncio.sleep(wait)
+
+    log.error(f"  ❌ All upload attempts failed for {filename}")
+    return False
 
 
 async def upload_video(bot, local_path: str, title: str, page_url: str) -> bool:
