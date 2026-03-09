@@ -3,3 +3,4 @@ requests==2.31.0
 beautifulsoup4==4.12.3
 lxml==5.2.1
 python-telegram-bot==21.3
+telethon==1.36.0
