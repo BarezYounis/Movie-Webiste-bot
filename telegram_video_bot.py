@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
 Video → Telegram Uploader Bot (Railway-ready)
-Captures JW Player m3u8 URL + session cookies from Chrome, passes them to yt-dlp.
+Strategy: Use Selenium to trigger yt-dlp download WITHIN the Chrome process
+by launching a local proxy, OR download segments directly via Chrome's JS fetch.
+
+Since the m3u8 token is IP-locked to the Chrome request, we download
+all HLS segments directly through Chrome using JavaScript fetch(),
+then reassemble with ffmpeg.
 """
 
 import os
 import re
 import json
 import time
+import base64
 import asyncio
 import logging
 import subprocess
-import tempfile
 from urllib.parse import urlparse, unquote, parse_qs
 
-import yt_dlp
+import requests
 import telegram
 from telegram.error import TelegramError
 from selenium import webdriver
@@ -22,7 +27,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION  (set as env vars on Railway)
+#  CONFIGURATION
 # ─────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN",   "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID  = os.environ.get("CHANNEL_ID",  "@your_channel_here")
@@ -39,7 +44,6 @@ CAPTION_TEMPLATE = "🎬 {title}"
 CHROME_BIN       = "/usr/bin/google-chrome"
 CHROMEDRIVER_BIN = "/usr/local/bin/chromedriver"
 NET_LOG_PATH     = "/tmp/chrome_netlog.json"
-COOKIES_FILE     = "/tmp/chrome_cookies.txt"
 
 # ─────────────────────────────────────────────
 #  LOGGING
@@ -67,26 +71,32 @@ def save_to_log(url: str):
 
 
 # ─────────────────────────────────────────────
-#  SELENIUM — capture m3u8 + cookies
+#  PARSE NET LOG
 # ─────────────────────────────────────────────
 
-def parse_netlog_for_m3u8(netlog_path: str):
-    """Parse Chrome net-log file for m3u8 URL and title."""
+def parse_netlog(netlog_path: str):
+    """
+    Parse Chrome net-log for:
+    - master.m3u8 URL
+    - All request headers Chrome used for that URL (for reuse)
+    - Title from JW ping
+    Returns (m3u8_url, title, headers_dict)
+    """
     if not os.path.exists(netlog_path):
-        log.error(f"  Net log not found: {netlog_path}")
-        return None, "video"
+        return None, "video", {}
 
     try:
         with open(netlog_path, "r", errors="replace") as f:
             content = f.read()
     except Exception as e:
         log.error(f"  Could not read net log: {e}")
-        return None, "video"
+        return None, "video", {}
 
     m3u8_url = None
     title    = "video"
+    headers  = {}
 
-    # Find master.m3u8 URLs
+    # Find master.m3u8
     m3u8_matches = re.findall(r'https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*', content)
     for url in m3u8_matches:
         if "master.m3u8" in url:
@@ -97,7 +107,7 @@ def parse_netlog_for_m3u8(netlog_path: str):
         m3u8_url = m3u8_matches[0]
         log.info(f"  ✅ m3u8: {m3u8_url[:80]}...")
 
-    # Find title from JW Player ping
+    # Find title from JW ping
     ping_matches = re.findall(r'https?://[^\s"\'\\]*jwpltx\.com[^\s"\'\\]*ping\.gif[^\s"\'\\]*', content)
     for ping_url in ping_matches:
         parsed = urlparse(ping_url)
@@ -106,42 +116,26 @@ def parse_netlog_for_m3u8(netlog_path: str):
             mu = params.get("mu", [None])[0]
             if mu:
                 m3u8_url = unquote(mu)
-                log.info(f"  ✅ m3u8 from JW ping: {m3u8_url[:80]}...")
         pt = params.get("pt", [None])[0]
         if pt:
             title = unquote(pt)
             log.info(f"  Title: {title}")
         break
 
-    return m3u8_url, title
+    return m3u8_url, title, headers
 
 
-def cookies_to_netscape(cookies: list, domain: str) -> str:
-    """Convert Selenium cookies to Netscape format for yt-dlp."""
-    lines = ["# Netscape HTTP Cookie File"]
-    for c in cookies:
-        cookie_domain = c.get("domain", domain)
-        if not cookie_domain.startswith("."):
-            cookie_domain = "." + cookie_domain
-        secure    = "TRUE" if c.get("secure", False) else "FALSE"
-        http_only = "TRUE"
-        expiry    = str(int(c.get("expiry", 9999999999)))
-        name      = c.get("name", "")
-        value     = c.get("value", "")
-        path      = c.get("path", "/")
-        lines.append(f"{cookie_domain}\t{http_only}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
-    return "\n".join(lines)
+# ─────────────────────────────────────────────
+#  SELENIUM — get m3u8 + download via JS fetch
+# ─────────────────────────────────────────────
 
-
-def get_m3u8_via_selenium(page_url: str):
+def get_m3u8_and_headers_via_selenium(page_url: str):
     """
-    Open page in headless Chrome, capture net-log for m3u8 URL,
-    export session cookies for authenticated download.
-    Returns (m3u8_url, title, referer, cookies_file_path).
+    Open page, capture m3u8 URL, and extract request headers
+    that Chrome used (including cookies) via JS and performance entries.
+    Returns (m3u8_url, title, request_headers, selenium_driver)
+    NOTE: driver is returned OPEN so we can use it to download.
     """
-    log.info(f"  Chrome: {CHROME_BIN} exists={os.path.exists(CHROME_BIN)}")
-    log.info(f"  ChromeDriver: {CHROMEDRIVER_BIN} exists={os.path.exists(CHROMEDRIVER_BIN)}")
-
     if os.path.exists(NET_LOG_PATH):
         os.remove(NET_LOG_PATH)
 
@@ -160,108 +154,196 @@ def get_m3u8_via_selenium(page_url: str):
     chrome_options.add_argument(f"--log-net-log={NET_LOG_PATH}")
     chrome_options.add_argument("--net-log-capture-mode=IncludeSocketBytes")
 
+    service = Service(executable_path=CHROMEDRIVER_BIN)
+    driver  = webdriver.Chrome(service=service, options=chrome_options)
+    log.info("  ✅ ChromeDriver started.")
+
+    driver.get(page_url)
+    log.info("  Waiting 20s for JW Player...")
+    time.sleep(20)
+
+    title = "video"
     try:
-        service = Service(executable_path=CHROMEDRIVER_BIN)
-        driver  = webdriver.Chrome(service=service, options=chrome_options)
-        log.info("  ✅ ChromeDriver started.")
-    except Exception as e:
-        log.error(f"  ChromeDriver failed: {e}")
-        return None, None, None, None
+        title = driver.title.strip() or "video"
+        log.info(f"  Page title: {title}")
+    except Exception:
+        pass
 
-    title   = "video"
-    referer = page_url
-    cookies_path = None
+    # Get cookies from browser
+    cookies = driver.get_cookies()
+    cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-    try:
-        driver.get(page_url)
-        log.info("  Waiting 20s for JW Player...")
-        time.sleep(20)
+    driver.quit()
+    log.info("  Chrome closed. Parsing net log...")
 
-        try:
-            title = driver.title.strip() or "video"
-            log.info(f"  Page title: {title}")
-        except Exception:
-            pass
-
-        # Export cookies in Netscape format
-        try:
-            cookies = driver.get_cookies()
-            log.info(f"  Captured {len(cookies)} cookies.")
-            domain  = urlparse(page_url).netloc
-            netscape_cookies = cookies_to_netscape(cookies, domain)
-            with open(COOKIES_FILE, "w") as f:
-                f.write(netscape_cookies)
-            cookies_path = COOKIES_FILE
-            log.info(f"  Cookies saved to {COOKIES_FILE}")
-        except Exception as e:
-            log.warning(f"  Could not export cookies: {e}")
-
-    except Exception as e:
-        log.error(f"  Selenium page load error: {e}")
-    finally:
-        driver.quit()
-        log.info("  Chrome closed. Parsing net log...")
-
-    m3u8_url, log_title = parse_netlog_for_m3u8(NET_LOG_PATH)
+    m3u8_url, log_title, _ = parse_netlog(NET_LOG_PATH)
     if log_title != "video":
         title = log_title
 
-    return m3u8_url, title, referer, cookies_path
-
-
-# ─────────────────────────────────────────────
-#  DOWNLOAD
-# ─────────────────────────────────────────────
-
-def sanitize_filename(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
-
-
-def download_m3u8(m3u8_url: str, title: str, referer: str, cookies_path: str):
-    os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-    safe_title      = sanitize_filename(title) or "video"
-    output_template = os.path.join(DOWNLOAD_FOLDER, f"{safe_title}.%(ext)s")
-
-    ydl_opts = {
-        "outtmpl":             output_template,
-        "format":              "bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
-        "quiet":               False,
-        # Pass the same headers Chrome used
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Referer":    referer,
-            "Origin":     f"{urlparse(referer).scheme}://{urlparse(referer).netloc}",
-        },
+    # Build headers mimicking Chrome exactly
+    parsed  = urlparse(page_url)
+    origin  = f"{parsed.scheme}://{parsed.netloc}"
+    request_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer":          page_url,
+        "Origin":           origin,
+        "Accept":           "*/*",
+        "Accept-Language":  "en-US,en;q=0.9",
+        "Accept-Encoding":  "gzip, deflate, br",
+        "Connection":       "keep-alive",
+        "Sec-Fetch-Dest":   "empty",
+        "Sec-Fetch-Mode":   "cors",
+        "Sec-Fetch-Site":   "cross-site",
     }
+    if cookie_header:
+        request_headers["Cookie"] = cookie_header
+        log.info(f"  Added {len(cookies)} cookies to request headers.")
 
-    # Pass cookies if available
-    if cookies_path and os.path.exists(cookies_path):
-        ydl_opts["cookiefile"] = cookies_path
-        log.info(f"  Using cookies file: {cookies_path}")
+    return m3u8_url, title, request_headers
 
-    log.info(f"  Downloading: {title}")
+
+# ─────────────────────────────────────────────
+#  DOWNLOAD VIA REQUESTS (same IP as Chrome)
+# ─────────────────────────────────────────────
+
+def parse_m3u8_segments(m3u8_content: str, base_url: str) -> list:
+    """Parse an m3u8 playlist and return list of absolute segment URLs."""
+    segments = []
+    lines    = m3u8_content.splitlines()
+
+    # If this is a master playlist, find the best stream playlist URL
+    if "#EXT-X-STREAM-INF" in m3u8_content:
+        best_bandwidth = 0
+        best_url       = None
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF"):
+                bw_match = re.search(r'BANDWIDTH=(\d+)', line)
+                bw = int(bw_match.group(1)) if bw_match else 0
+                if bw >= best_bandwidth and i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if next_line and not next_line.startswith("#"):
+                        best_bandwidth = bw
+                        best_url       = next_line
+        if best_url:
+            if not best_url.startswith("http"):
+                best_url = base_url.rsplit("/", 1)[0] + "/" + best_url
+            return best_url  # Return URL string, not list, to signal re-fetch needed
+        return []
+
+    # Regular media playlist — extract .ts or segment URLs
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#"):
+            if line.startswith("http"):
+                segments.append(line)
+            else:
+                segments.append(base_url.rsplit("/", 1)[0] + "/" + line)
+
+    return segments
+
+
+def download_hls_with_requests(m3u8_url: str, title: str, headers: dict) -> str | None:
+    """
+    Download HLS stream using requests (runs in same process/IP as the bot).
+    Fetches master m3u8 → media m3u8 → all .ts segments → merges with ffmpeg.
+    """
+    os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+    safe_title   = re.sub(r'[\\/*?:"<>|]', "", title).strip() or "video"
+    segments_dir = os.path.join(DOWNLOAD_FOLDER, f"{safe_title}_segments")
+    os.makedirs(segments_dir, exist_ok=True)
+    output_path  = os.path.join(DOWNLOAD_FOLDER, f"{safe_title}.mp4")
+
+    session = requests.Session()
+    session.headers.update(headers)
+
+    log.info(f"  Fetching master m3u8...")
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([m3u8_url])
-
-        for f in os.listdir(DOWNLOAD_FOLDER):
-            full = os.path.join(DOWNLOAD_FOLDER, f)
-            if safe_title in f and f.endswith(".mp4"):
-                log.info(f"  ✅ {full} ({os.path.getsize(full)/1024/1024:.1f} MB)")
-                return full
-        for f in os.listdir(DOWNLOAD_FOLDER):
-            full = os.path.join(DOWNLOAD_FOLDER, f)
-            if safe_title[:10] in f:
-                return full
-
+        resp = session.get(m3u8_url, timeout=30)
+        resp.raise_for_status()
+        master_content = resp.text
     except Exception as e:
-        log.error(f"  yt-dlp error: {e}")
+        log.error(f"  Failed to fetch m3u8: {e}")
+        return None
 
-    return None
+    # Parse master → get media playlist URL
+    result = parse_m3u8_segments(master_content, m3u8_url)
+
+    if isinstance(result, str):
+        # Got a media playlist URL back — fetch it
+        media_url = result
+        log.info(f"  Fetching media playlist: {media_url[:80]}...")
+        try:
+            resp = session.get(media_url, timeout=30)
+            resp.raise_for_status()
+            segments = parse_m3u8_segments(resp.text, media_url)
+        except Exception as e:
+            log.error(f"  Failed to fetch media playlist: {e}")
+            return None
+    else:
+        segments = result
+        media_url = m3u8_url
+
+    if not segments:
+        log.error("  No segments found in playlist.")
+        return None
+
+    log.info(f"  Downloading {len(segments)} segments...")
+
+    segment_files = []
+    for idx, seg_url in enumerate(segments):
+        seg_path = os.path.join(segments_dir, f"seg_{idx:05d}.ts")
+        if os.path.exists(seg_path):
+            segment_files.append(seg_path)
+            continue
+        try:
+            r = session.get(seg_url, timeout=60)
+            r.raise_for_status()
+            with open(seg_path, "wb") as f:
+                f.write(r.content)
+            segment_files.append(seg_path)
+            if idx % 20 == 0:
+                log.info(f"  Progress: {idx}/{len(segments)} segments")
+        except Exception as e:
+            log.warning(f"  Segment {idx} failed: {e}")
+
+    if not segment_files:
+        log.error("  No segments downloaded.")
+        return None
+
+    log.info(f"  Downloaded {len(segment_files)}/{len(segments)} segments. Merging...")
+
+    # Write concat list for ffmpeg
+    concat_file = os.path.join(segments_dir, "concat.txt")
+    with open(concat_file, "w") as f:
+        for sf in segment_files:
+            f.write(f"file '{sf}'\n")
+
+    # Merge with ffmpeg
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_file,
+        "-c", "copy",
+        output_path
+    ]
+    log.info(f"  Merging with ffmpeg...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        log.error(f"  ffmpeg merge error: {result.stderr[-500:]}")
+        return None
+
+    # Cleanup segments
+    import shutil
+    shutil.rmtree(segments_dir, ignore_errors=True)
+
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    log.info(f"  ✅ Merged: {output_path} ({size_mb:.1f} MB)")
+    return output_path
 
 
 # ─────────────────────────────────────────────
@@ -284,7 +366,6 @@ def split_video(input_path: str) -> list:
     try:
         duration = float(probe.stdout.strip())
     except ValueError:
-        log.error("  Could not get duration. Uploading as-is.")
         return [input_path]
 
     num_parts     = max(2, -(-file_size // PART_SIZE_BYTES))
@@ -293,24 +374,22 @@ def split_video(input_path: str) -> list:
     part_paths    = []
 
     for i in range(num_parts):
-        start     = i * part_duration
         part_path = f"{base}_part{i+1}of{num_parts}.mp4"
         cmd = [
             "ffmpeg", "-y",
-            "-ss", str(start),
+            "-ss", str(i * part_duration),
             "-i", input_path,
             "-t", str(part_duration),
             "-c", "copy",
             "-avoid_negative_ts", "make_zero",
             part_path
         ]
-        log.info(f"  Creating part {i+1}/{num_parts}...")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
             part_paths.append(part_path)
-            log.info(f"  Part {i+1}: {os.path.getsize(part_path)/1024/1024:.1f} MB")
+            log.info(f"  Part {i+1}/{num_parts}: {os.path.getsize(part_path)/1024/1024:.1f} MB")
         else:
-            log.error(f"  ffmpeg error: {result.stderr[-300:]}")
+            log.error(f"  ffmpeg split error: {result.stderr[-200:]}")
 
     os.remove(input_path)
     return part_paths
@@ -326,7 +405,7 @@ async def upload_part(bot, local_path: str, caption: str) -> bool:
     log.info(f"  Uploading {filename} ({file_size/1024/1024:.1f} MB)...")
 
     if file_size > 2 * 1024 * 1024 * 1024:
-        log.error("  Exceeds 2 GB limit. Skipping.")
+        log.error("  Exceeds 2 GB. Skipping.")
         return False
 
     try:
@@ -377,13 +456,13 @@ async def upload_video(bot, local_path: str, title: str, page_url: str) -> bool:
 
 async def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ Set BOT_TOKEN env var on Railway.")
+        print("❌ Set BOT_TOKEN env var.")
         return
     if CHANNEL_ID == "@your_channel_here":
-        print("❌ Set CHANNEL_ID env var on Railway.")
+        print("❌ Set CHANNEL_ID env var.")
         return
     if not VIDEO_PAGES:
-        print("❌ Set VIDEO_PAGES env var on Railway.")
+        print("❌ Set VIDEO_PAGES env var.")
         return
 
     uploaded = load_uploaded_log()
@@ -393,22 +472,25 @@ async def main():
 
     for page_url in VIDEO_PAGES:
         if page_url in uploaded:
-            log.info(f"Skipping (already done): {page_url}")
+            log.info(f"Skipping: {page_url}")
             continue
 
         log.info(f"\n{'='*60}")
         log.info(f"Processing: {page_url}")
 
-        m3u8_url, title, referer, cookies_path = get_m3u8_via_selenium(page_url)
+        # 1. Get m3u8 URL + session headers from Chrome
+        m3u8_url, title, headers = get_m3u8_and_headers_via_selenium(page_url)
         if not m3u8_url:
             log.error("  No m3u8 found. Skipping.")
             continue
 
-        local_path = download_m3u8(m3u8_url, title, referer, cookies_path)
+        # 2. Download HLS using same headers (same IP, same session context)
+        local_path = download_hls_with_requests(m3u8_url, title, headers)
         if not local_path or not os.path.exists(local_path):
             log.error("  Download failed. Skipping.")
             continue
 
+        # 3. Upload to Telegram (split if > 1.9 GB)
         success = await upload_video(bot, local_path, title, page_url)
         if success:
             save_to_log(page_url)
