@@ -250,6 +250,7 @@ def format_caption(details: dict) -> str:
 def parse_netlog(netlog_path: str):
     if not os.path.exists(netlog_path):
         return None
+
     try:
         with open(netlog_path, "r", errors="replace") as f:
             content = f.read()
@@ -257,24 +258,20 @@ def parse_netlog(netlog_path: str):
         log.error(f"  Net log read error: {e}")
         return None
 
-    for url in re.findall(r'https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*', content):
-        if "master.m3u8" in url:
-            log.info(f"  ✅ master.m3u8: {url[:80]}...")
-            return url
-
     matches = re.findall(r'https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*', content)
-    if matches:
-        log.info(f"  ✅ m3u8: {matches[0][:80]}...")
-        return matches[0]
+    if not matches:
+        return None
 
-    for ping_url in re.findall(r'https?://[^\s"\'\\]*jwpltx\.com[^\s"\'\\]*ping\.gif[^\s"\'\\]*', content):
-        mu = parse_qs(urlparse(ping_url).query).get("mu", [None])[0]
-        if mu:
-            url = unquote(mu)
-            log.info(f"  ✅ m3u8 from ping: {url[:80]}...")
-            return url
+    # Prefer final media playlists over master.m3u8
+    non_master = [u for u in matches if "master.m3u8" not in u]
+    if non_master:
+        chosen = non_master[-1]
+        log.info(f"  ✅ media m3u8: {chosen[:100]}...")
+        return chosen
 
-    return None
+    chosen = matches[-1]
+    log.info(f"  ✅ fallback m3u8: {chosen[:100]}...")
+    return chosen
 
 
 
