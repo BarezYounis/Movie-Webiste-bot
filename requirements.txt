@@ -1,0 +1,4 @@
+selenium==4.20.0
+yt-dlp==2024.4.9
+python-telegram-bot==21.3
+requests==2.31.0
