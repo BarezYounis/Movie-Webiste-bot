@@ -34,7 +34,8 @@ from selenium.webdriver.chrome.service import Service
 # ─────────────────────────────────────────────
 BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID   = os.environ.get("CHANNEL_ID",   "@your_channel_here")
-SITE_URL     = os.environ.get("SITE_URL",     "https://kurdfilm.krd")
+_pages_env  = os.environ.get("VIDEO_PAGES", "")
+VIDEO_PAGES  = [u.strip() for u in _pages_env.split(",") if u.strip()]
 
 RUN_HOUR     = int(os.environ.get("RUN_HOUR",    "2"))
 RUN_MINUTE   = int(os.environ.get("RUN_MINUTE",  "0"))
@@ -625,9 +626,8 @@ async def run_daily_job(bot):
     log.info(f"Daily job @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
     uploaded   = load_uploaded_log()
-    movie_urls = crawl_movie_pages(SITE_URL)
-    new_movies = [u for u in movie_urls if u not in uploaded]
-    log.info(f"New movies: {len(new_movies)} | Already done: {len(uploaded)}")
+    new_movies = [u for u in VIDEO_PAGES if u not in uploaded]
+    log.info(f"Queued: {len(VIDEO_PAGES)} | New: {len(new_movies)} | Already done: {len(uploaded)}")
 
     if DAILY_LIMIT > 0 and len(new_movies) > DAILY_LIMIT:
         log.info(f"Daily limit: processing {DAILY_LIMIT} of {len(new_movies)}.")
@@ -652,7 +652,7 @@ async def run_daily_job(bot):
 async def scheduler():
     bot = telegram.Bot(token=BOT_TOKEN)
     log.info(f"Bot started. Scheduled daily at {RUN_HOUR:02d}:{RUN_MINUTE:02d} UTC.")
-    log.info(f"Site: {SITE_URL} | Channel: {CHANNEL_ID} | Daily limit: {DAILY_LIMIT}")
+    log.info(f"Channel: {CHANNEL_ID} | Movies queued: {len(VIDEO_PAGES)} | Daily limit: {DAILY_LIMIT}")
 
     # Run immediately on startup
     await run_daily_job(bot)
@@ -679,5 +679,8 @@ if __name__ == "__main__":
         exit(1)
     if CHANNEL_ID == "@your_channel_here":
         print("❌ Set CHANNEL_ID env var.")
+        exit(1)
+    if not VIDEO_PAGES:
+        print("❌ Set VIDEO_PAGES env var (comma-separated URLs).")
         exit(1)
     asyncio.run(scheduler())
