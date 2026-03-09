@@ -1,68 +1,75 @@
 
 #!/usr/bin/env python3
 """
-ZedFlix -> Telegram Bot (Final Combined Fixed)
+Telegram link-trigger video bot (trigger-only)
 
-Features
-- Daily scheduled VIDEO_PAGES processing
-- Telegram private-message link trigger
-- Queue processing (one job at a time)
-- Selenium capture of m3u8 + cookies/headers
-- Prefer final media playlist from browser netlog (avoids many 403s)
-- Fallback to master playlist when needed
-- Direct ffmpeg HLS download with browser-like headers
-- No re-encoding for quality/speed
-- Mobile-safe remux for Telegram playback
-- Explicit Telegram video attributes (width/height/duration)
+What it does
+- Waits for you to send a webpage link to the bot in PRIVATE chat
+- Opens the page in headless Chrome
+- Captures the HLS playlist and browser cookies/headers
+- Prefers the final media playlist to avoid 403 errors
+- Falls back to the master playlist and chooses the best HD variant when available
+- Downloads with ffmpeg without re-encoding
+- Applies a mobile-safe MP4 remux for better Telegram playback
+- Posts thumbnail + caption to your channel
+- Uploads the video as a reply to the thumbnail post
+
+What it does NOT do
+- No daily scheduler
+- No VIDEO_PAGES startup job
+- No auto-run on restart
+
+Required environment variables
+- BOT_TOKEN
+- API_ID
+- API_HASH
+- CHANNEL_ID
+- OWNER_USER_ID   (or set ALLOW_ALL_USERS=true)
+
+Optional environment variables
+- ALLOW_ALL_USERS=false
+- DOWNLOAD_FOLDER=/tmp/downloads
+- CHROME_BIN=/usr/bin/google-chrome
+- CHROMEDRIVER_BIN=/usr/local/bin/chromedriver
+- NET_LOG_PATH=/tmp/chrome_netlog.json
 """
 
 import os
 import re
-import time
 import json
-import shutil
+import time
 import asyncio
 import logging
 import subprocess
-from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
 import telegram
 from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeVideo
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
+
 # -------------------------------------------------
-# CONFIGURATION
+# CONFIG
 # -------------------------------------------------
 
-TL_CHANNEL = None  # resolved at startup
+TL_CHANNEL = None
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "@your_channel_here")
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 
-_pages_env = os.environ.get("VIDEO_PAGES", "")
-VIDEO_PAGES = [u.strip() for u in _pages_env.split(",") if u.strip()]
-
-RUN_HOUR = int(os.environ.get("RUN_HOUR", "2"))
-RUN_MINUTE = int(os.environ.get("RUN_MINUTE", "0"))
-DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))
-
-DOWNLOAD_FOLDER = os.environ.get("DOWNLOAD_FOLDER", "/tmp/downloads")
-UPLOADED_LOG = os.environ.get("UPLOADED_LOG", "/tmp/uploaded_movies.txt")
-UPLOAD_DELAY = int(os.environ.get("UPLOAD_DELAY", "5"))
-
 OWNER_USER_ID = os.environ.get("OWNER_USER_ID", "").strip()
 ALLOW_ALL_USERS = os.environ.get("ALLOW_ALL_USERS", "false").strip().lower() == "true"
 
+DOWNLOAD_FOLDER = os.environ.get("DOWNLOAD_FOLDER", "/tmp/downloads")
 CHROME_BIN = os.environ.get("CHROME_BIN", "/usr/bin/google-chrome")
 CHROMEDRIVER_BIN = os.environ.get("CHROMEDRIVER_BIN", "/usr/local/bin/chromedriver")
 NET_LOG_PATH = os.environ.get("NET_LOG_PATH", "/tmp/chrome_netlog.json")
@@ -73,36 +80,15 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# -------------------------------------------------
-# LOGGING
-# -------------------------------------------------
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
 
-# -------------------------------------------------
-# GLOBAL STATE
-# -------------------------------------------------
-
 link_queue: asyncio.Queue = asyncio.Queue()
 queue_seen = set()
 
-# -------------------------------------------------
-# UPLOADED LOG
-# -------------------------------------------------
-
-def load_uploaded_log():
-    if not os.path.exists(UPLOADED_LOG):
-        return set()
-    with open(UPLOADED_LOG, "r", encoding="utf-8", errors="ignore") as f:
-        return set(line.strip() for line in f if line.strip())
-
-def save_to_log(url: str):
-    with open(UPLOADED_LOG, "a", encoding="utf-8") as f:
-        f.write(url + "\n")
 
 # -------------------------------------------------
 # HELPERS
@@ -111,9 +97,7 @@ def save_to_log(url: str):
 def is_allowed_user(user_id: int) -> bool:
     if ALLOW_ALL_USERS:
         return True
-    if OWNER_USER_ID and str(user_id) == OWNER_USER_ID:
-        return True
-    return False
+    return bool(OWNER_USER_ID and str(user_id) == OWNER_USER_ID)
 
 def extract_urls(text: str):
     if not text:
@@ -132,8 +116,9 @@ def resolve_url(base_url: str, maybe_relative: str) -> str:
         return maybe_relative
     return urljoin(base_url, maybe_relative)
 
+
 # -------------------------------------------------
-# SITE SCRAPER
+# SCRAPER
 # -------------------------------------------------
 
 def scrape_movie_details(page_url: str) -> dict:
@@ -219,6 +204,7 @@ def format_caption(details: dict) -> str:
     lines.append(f"🔗 [Watch on site]({details['page_url']})")
     return "\n".join(lines)
 
+
 # -------------------------------------------------
 # SELENIUM / NETLOG
 # -------------------------------------------------
@@ -262,18 +248,12 @@ def parse_netlog_urls(netlog_path: str):
 
     return []
 
-def choose_netlog_playlists(urls: list[str]) -> tuple[str | None, str | None]:
+def choose_netlog_playlists(urls):
     if not urls:
         return None, None
 
-    media_candidates = [
-        u for u in urls
-        if "master.m3u8" not in u.lower()
-    ]
-    master_candidates = [
-        u for u in urls
-        if "master.m3u8" in u.lower()
-    ]
+    media_candidates = [u for u in urls if "master.m3u8" not in u.lower()]
+    master_candidates = [u for u in urls if "master.m3u8" in u.lower()]
 
     media_url = media_candidates[-1] if media_candidates else None
     master_url = master_candidates[-1] if master_candidates else None
@@ -344,8 +324,9 @@ def get_m3u8_candidates_and_headers(page_url: str):
 
     return media_url, master_url, headers
 
+
 # -------------------------------------------------
-# HLS PARSING / QUALITY CHOICE
+# HLS QUALITY
 # -------------------------------------------------
 
 def parse_master_variants(master_text: str, master_url: str):
@@ -379,7 +360,7 @@ def parse_master_variants(master_text: str, master_url: str):
 
     return variants
 
-def choose_best_hd_variant(variants: list[dict]):
+def choose_best_hd_variant(variants):
     if not variants:
         return None
 
@@ -392,8 +373,7 @@ def choose_best_hd_variant(variants: list[dict]):
     for target in (1080, 720):
         candidates = [v for v in variants if v.get("height", 0) == target]
         if candidates:
-            chosen = sorted(candidates, key=lambda v: v.get("bandwidth", 0), reverse=True)[0]
-            return chosen
+            return sorted(candidates, key=lambda v: v.get("bandwidth", 0), reverse=True)[0]
 
     return variants[0]
 
@@ -419,6 +399,7 @@ def fetch_master_and_choose_variant(master_url: str, headers: dict):
     except Exception as e:
         log.warning(f"  Master playlist parse failed: {e}")
         return None
+
 
 # -------------------------------------------------
 # DOWNLOAD / REMUX / PROBE
@@ -469,6 +450,7 @@ def probe_video(path: str) -> dict:
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         return {"width": 0, "height": 0, "duration": 0}
+
     try:
         data = json.loads(res.stdout)
         stream = (data.get("streams") or [{}])[0]
@@ -484,14 +466,8 @@ def probe_video(path: str) -> dict:
         return {"width": 0, "height": 0, "duration": 0}
 
 def normalize_mp4_for_mobile(input_path: str) -> str:
-    """
-    Try to normalize SAR metadata without re-encoding.
-    For many H.264 streams this removes the Telegram mobile zoom issue.
-    If normalization fails, return original file.
-    """
     meta = probe_video(input_path)
     codec = (meta.get("codec_name") or "").lower()
-
     temp_out = os.path.splitext(input_path)[0] + "_mobile.mp4"
 
     if codec == "h264":
@@ -535,6 +511,7 @@ def normalize_mp4_for_mobile(input_path: str) -> str:
 
     log.info("  ✅ Mobile-safe remux completed.")
     return temp_out
+
 
 # -------------------------------------------------
 # TELEGRAM
@@ -611,8 +588,9 @@ async def upload_video(tl_client, input_path: str, title: str, reply_to: int | N
         except Exception:
             pass
 
+
 # -------------------------------------------------
-# CORE PROCESSING
+# CORE
 # -------------------------------------------------
 
 async def process_movie(tg_bot, tl_client, page_url: str, app: Application | None = None, notify_chat_id: int | None = None) -> bool:
@@ -642,6 +620,8 @@ async def process_movie(tg_bot, tl_client, page_url: str, app: Application | Non
         await notify_user(app, notify_chat_id, "❌ Could not choose a playable HLS stream.")
         return False
 
+    await notify_user(app, notify_chat_id, "⏳ Processing started...")
+
     thumb_msg_id = await post_thumbnail(tg_bot, details)
     await asyncio.sleep(2)
 
@@ -653,14 +633,13 @@ async def process_movie(tg_bot, tl_client, page_url: str, app: Application | Non
 
     if not local_path:
         log.error("  Download failed.")
-        await notify_user(app, notify_chat_id, "❌ Download failed. The site returned a protected stream (403) or blocked replay.")
+        await notify_user(app, notify_chat_id, "❌ Download failed. The site blocked replay or returned a protected stream.")
         return False
 
     local_path = normalize_mp4_for_mobile(local_path)
     success = await upload_video(tl_client, local_path, details["title"], thumb_msg_id)
 
     if success:
-        save_to_log(page_url)
         log.info(f"  ✅ Done: {details['title']}")
         await notify_user(app, notify_chat_id, f"✅ Finished: {details['title']}")
     else:
@@ -668,8 +647,9 @@ async def process_movie(tg_bot, tl_client, page_url: str, app: Application | Non
 
     return success
 
+
 # -------------------------------------------------
-# QUEUE / LINK TRIGGER
+# QUEUE / TRIGGER
 # -------------------------------------------------
 
 async def enqueue_link(url: str, source_chat_id: int | None = None):
@@ -695,7 +675,6 @@ async def link_queue_worker(app: Application, tg_bot, tl_client):
         finally:
             queue_seen.discard(key)
             link_queue.task_done()
-            await asyncio.sleep(UPLOAD_DELAY)
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.effective_chat or not update.message:
@@ -704,67 +683,32 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    if update.effective_chat.type != "private":
+        return
+
     if not is_allowed_user(user_id):
         await update.message.reply_text("❌ You are not allowed to use this bot.")
         return
 
-    if update.effective_chat.type != "private":
-        return
-
     urls = extract_urls(update.message.text or "")
     if not urls:
-        await update.message.reply_text("Send a web link and I will start processing it on Railway.")
+        await update.message.reply_text("Send a web link in private chat.")
         return
+
+    log.info(f"Telegram link received from {user_id}: {urls}")
 
     added = 0
     for url in urls:
         ok = await enqueue_link(url, chat_id)
         if ok:
+            log.info(f"Queued from Telegram: {url}")
             added += 1
 
     if added:
-        await update.message.reply_text(f"✅ Queued {added} link(s). Processing will start automatically.")
+        await update.message.reply_text(f"✅ Queued {added} link(s).")
     else:
-        await update.message.reply_text("ℹ️ Those link(s) are already in the queue.")
+        await update.message.reply_text("ℹ️ That link is already being processed.")
 
-# -------------------------------------------------
-# DAILY JOB / SCHEDULER
-# -------------------------------------------------
-
-async def run_daily_job(app: Application, tg_bot, tl_client):
-    log.info(f"\n{'#'*60}")
-    log.info(f"Daily job @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-
-    uploaded = load_uploaded_log()
-    new_movies = [u for u in VIDEO_PAGES if u not in uploaded]
-    log.info(f"Queued: {len(VIDEO_PAGES)} | New: {len(new_movies)} | Already done: {len(uploaded)}")
-
-    if DAILY_LIMIT > 0 and len(new_movies) > DAILY_LIMIT:
-        log.info(f"Daily limit: processing {DAILY_LIMIT} of {len(new_movies)}.")
-        new_movies = new_movies[:DAILY_LIMIT]
-
-    for page_url in new_movies:
-        await enqueue_link(page_url, None)
-
-    log.info(f"Daily job queued: {len(new_movies)}/{len(VIDEO_PAGES)} movies.")
-
-async def scheduler_loop(app: Application, tg_bot, tl_client):
-    log.info(f"Bot started. Scheduled daily at {RUN_HOUR:02d}:{RUN_MINUTE:02d} UTC.")
-    log.info(f"Channel: {CHANNEL_ID} | Movies queued: {len(VIDEO_PAGES)} | Daily limit: {DAILY_LIMIT}")
-    log.info("Send a web link to the bot in Telegram private chat to start processing immediately.")
-
-    await run_daily_job(app, tg_bot, tl_client)
-
-    while True:
-        now = datetime.utcnow()
-        secs = (((RUN_HOUR - now.hour) % 24) * 3600
-                + ((RUN_MINUTE - now.minute) % 60) * 60
-                - now.second)
-        if secs <= 0:
-            secs += 86400
-        log.info(f"Next scheduled run in {secs // 3600}h {(secs % 3600) // 60}m")
-        await asyncio.sleep(secs)
-        await run_daily_job(app, tg_bot, tl_client)
 
 # -------------------------------------------------
 # MAIN
@@ -778,6 +722,9 @@ async def main():
         raise SystemExit(1)
     if CHANNEL_ID == "@your_channel_here":
         print("❌ Set CHANNEL_ID env var.")
+        raise SystemExit(1)
+    if API_ID == 0 or not API_HASH:
+        print("❌ Set API_ID and API_HASH env vars.")
         raise SystemExit(1)
     if not ALLOW_ALL_USERS and not OWNER_USER_ID:
         print("❌ Set OWNER_USER_ID or ALLOW_ALL_USERS=true.")
@@ -810,14 +757,15 @@ async def main():
     await app.updater.start_polling(drop_pending_updates=True)
 
     worker_task = asyncio.create_task(link_queue_worker(app, tg_bot, tl_client))
-    scheduler_task = asyncio.create_task(scheduler_loop(app, tg_bot, tl_client))
+
+    log.info("Bot started in trigger-only mode.")
+    log.info("Send a web link to the bot in Telegram private chat to start processing.")
 
     try:
         while True:
             await asyncio.sleep(3600)
     finally:
         worker_task.cancel()
-        scheduler_task.cancel()
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
