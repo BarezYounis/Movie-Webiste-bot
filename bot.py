@@ -330,37 +330,80 @@ def get_m3u8_and_headers(page_url: str):
 # ─────────────────────────────────────────────
 
 def parse_m3u8(content: str, base_url: str):
-    """Parse m3u8 content. Returns media playlist URL (str) or segment list (list)."""
+    """
+    Parse m3u8 content.
+    Returns:
+      - list of variant dicts for master playlists
+      - list of segment URLs for media playlists
+    """
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+
     if "#EXT-X-STREAM-INF" in content:
-        best_bw  = 0
-        best_url = None
-        lines    = content.splitlines()
+        variants = []
         for i, line in enumerate(lines):
-            if line.startswith("#EXT-X-STREAM-INF"):
-                m  = re.search(r'BANDWIDTH=(\d+)', line)
-                bw = int(m.group(1)) if m else 0
-                if bw >= best_bw and i + 1 < len(lines):
-                    nxt = lines[i + 1].strip()
-                    if nxt and not nxt.startswith("#"):
-                        best_bw  = bw
-                        best_url = nxt
-        if best_url:
-            if not best_url.startswith("http"):
-                best_url = base_url.rsplit("/", 1)[0] + "/" + best_url
-            return best_url  # string = need to fetch this playlist
-        return []
+            if not line.startswith("#EXT-X-STREAM-INF"):
+                continue
+
+            bw_match = re.search(r'BANDWIDTH=(\d+)', line)
+            res_match = re.search(r'RESOLUTION=(\d+)x(\d+)', line)
+            frame_match = re.search(r'FRAME-RATE=([\d.]+)', line)
+
+            next_url = None
+            for j in range(i + 1, len(lines)):
+                if not lines[j].startswith("#"):
+                    next_url = lines[j]
+                    break
+
+            if not next_url:
+                continue
+
+            variants.append({
+                "bandwidth": int(bw_match.group(1)) if bw_match else 0,
+                "width": int(res_match.group(1)) if res_match else 0,
+                "height": int(res_match.group(2)) if res_match else 0,
+                "frame_rate": float(frame_match.group(1)) if frame_match else 0.0,
+                "url": next_url if next_url.startswith("http") else urljoin(base_url, next_url),
+                "raw": line,
+            })
+        return variants
 
     segments = []
-    for line in content.splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            segments.append(line if line.startswith("http") else base_url.rsplit("/", 1)[0] + "/" + line)
+    for line in lines:
+        if not line.startswith("#"):
+            segments.append(line if line.startswith("http") else urljoin(base_url, line))
     return segments
+
+
+def choose_best_hd_variant(variants: list[dict]) -> dict | None:
+    """
+    Prefer the highest true HD stream without re-encoding:
+      1) 1080p+ (best bandwidth wins)
+      2) 720p (best bandwidth wins)
+      3) any highest resolution available
+    """
+    if not variants:
+        return None
+
+    variants = sorted(
+        variants,
+        key=lambda v: (v.get("height", 0), v.get("width", 0), v.get("bandwidth", 0), v.get("frame_rate", 0.0)),
+        reverse=True,
+    )
+
+    hd_1080 = [v for v in variants if v.get("height", 0) >= 1080]
+    if hd_1080:
+        return hd_1080[0]
+
+    hd_720 = [v for v in variants if 720 <= v.get("height", 0) < 1080]
+    if hd_720:
+        return hd_720[0]
+
+    return variants[0]
 
 
 def download_hls(m3u8_url: str, title: str, headers: dict) -> str | None:
     os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-    safe       = re.sub(r'[\\/*?:"<>|]', "", title).strip() or "video"
+    safe       = re.sub(r'[\/*?:"<>|]', "", title).strip() or "video"
     segs_dir   = os.path.join(DOWNLOAD_FOLDER, f"{safe}_segs")
     os.makedirs(segs_dir, exist_ok=True)
     output     = os.path.join(DOWNLOAD_FOLDER, f"{safe}.mp4")
@@ -368,7 +411,6 @@ def download_hls(m3u8_url: str, title: str, headers: dict) -> str | None:
     session = requests.Session()
     session.headers.update(headers)
 
-    # Fetch master playlist
     log.info("  Fetching master m3u8...")
     try:
         r = session.get(m3u8_url, timeout=30)
@@ -378,12 +420,21 @@ def download_hls(m3u8_url: str, title: str, headers: dict) -> str | None:
         shutil.rmtree(segs_dir, ignore_errors=True)
         return None
 
-    result = parse_m3u8(r.text, m3u8_url)
+    playlist = parse_m3u8(r.text, m3u8_url)
 
-    # If master playlist, fetch media playlist
-    if isinstance(result, str):
-        media_url = result
-        log.info(f"  Fetching media playlist: {media_url[:80]}...")
+    if playlist and isinstance(playlist[0], dict):
+        best_variant = choose_best_hd_variant(playlist)
+        if not best_variant:
+            log.error("  No playable variant found in master playlist.")
+            shutil.rmtree(segs_dir, ignore_errors=True)
+            return None
+
+        media_url = best_variant["url"]
+        log.info(
+            f"  Selected variant: {best_variant.get('width', 0)}x{best_variant.get('height', 0)} "
+            f"| {best_variant.get('bandwidth', 0)} bps"
+        )
+
         try:
             r = session.get(media_url, timeout=30)
             r.raise_for_status()
@@ -393,7 +444,8 @@ def download_hls(m3u8_url: str, title: str, headers: dict) -> str | None:
             shutil.rmtree(segs_dir, ignore_errors=True)
             return None
     else:
-        segments = result
+        segments = playlist
+        log.info("  Master playlist not found; using direct media playlist.")
 
     if not segments:
         log.error("  No segments found in playlist.")
@@ -415,13 +467,18 @@ def download_hls(m3u8_url: str, title: str, headers: dict) -> str | None:
                     f.write(r.content)
                 seg_files.append(seg_path)
                 break
-            except Exception:
+            except Exception as e:
                 if attempt == 2:
-                    log.warning(f"  Skipping segment {idx} after 3 failures")
+                    log.warning(f"  Skipping segment {idx} after 3 failures: {e}")
         if idx % 50 == 0:
             log.info(f"  Progress: {idx}/{len(segments)} segments")
 
-    log.info(f"  Downloaded {len(seg_files)}/{len(segments)} segments. Merging...")
+    if not seg_files:
+        log.error("  All segment downloads failed.")
+        shutil.rmtree(segs_dir, ignore_errors=True)
+        return None
+
+    log.info(f"  Downloaded {len(seg_files)}/{len(segments)} segments. Merging without re-encoding...")
 
     concat = os.path.join(segs_dir, "concat.txt")
     with open(concat, "w") as f:
@@ -429,8 +486,19 @@ def download_hls(m3u8_url: str, title: str, headers: dict) -> str | None:
             f.write(f"file '{sf}'\n")
 
     res = subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat, "-c", "copy", output],
-        capture_output=True, text=True
+        [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat,
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            output,
+        ],
+        capture_output=True,
+        text=True,
     )
     shutil.rmtree(segs_dir, ignore_errors=True)
     log.info("  Segments cleaned up.")
