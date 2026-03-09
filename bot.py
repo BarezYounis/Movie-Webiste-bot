@@ -38,7 +38,7 @@ BOT_TOKEN       = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID      = os.environ.get("CHANNEL_ID", "@your_channel_here")
 API_ID          = int(os.environ.get("API_ID", "0"))
 API_HASH        = os.environ.get("API_HASH", "")
-OWNER_USER_ID   = int(os.environ.get("OWNER_USER_ID", "0"))  # optional: only accept links from this Telegram user id
+OWNER_USER_ID   = int(os.environ.get("OWNER_USER_ID", "1166019209"))  # optional: only accept links from this Telegram user id
 ALLOW_ALL_USERS = os.environ.get("ALLOW_ALL_USERS", "false").lower() == "true"
 
 _pages_env = os.environ.get("VIDEO_PAGES", "")
