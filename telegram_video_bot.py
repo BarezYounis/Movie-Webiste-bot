@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
 Video → Telegram Uploader Bot (Railway-ready)
-Strategy: Use Selenium to trigger yt-dlp download WITHIN the Chrome process
-by launching a local proxy, OR download segments directly via Chrome's JS fetch.
-
-Since the m3u8 token is IP-locked to the Chrome request, we download
-all HLS segments directly through Chrome using JavaScript fetch(),
-then reassemble with ffmpeg.
+Key fix: creates one split part at a time, uploads it, deletes it before next part.
+This keeps disk usage at ~2x part size max instead of full file + all parts.
 """
 
 import os
 import re
 import json
 import time
-import base64
+import shutil
 import asyncio
 import logging
 import subprocess
@@ -38,7 +34,7 @@ VIDEO_PAGES = [u.strip() for u in _pages_env.split(",") if u.strip()]
 DOWNLOAD_FOLDER  = os.environ.get("DOWNLOAD_FOLDER", "/tmp/downloads")
 UPLOADED_LOG     = os.environ.get("UPLOADED_LOG",    "/tmp/uploaded_videos.txt")
 UPLOAD_DELAY     = int(os.environ.get("UPLOAD_DELAY", "5"))
-PART_SIZE_BYTES  = int(os.environ.get("PART_SIZE_MB", "1900")) * 1024 * 1024
+PART_SIZE_BYTES  = int(os.environ.get("PART_SIZE_MB", "1800")) * 1024 * 1024  # 1.8 GB default
 
 CAPTION_TEMPLATE = "🎬 {title}"
 CHROME_BIN       = "/usr/bin/google-chrome"
@@ -71,32 +67,22 @@ def save_to_log(url: str):
 
 
 # ─────────────────────────────────────────────
-#  PARSE NET LOG
+#  SELENIUM — capture m3u8 + cookies
 # ─────────────────────────────────────────────
 
 def parse_netlog(netlog_path: str):
-    """
-    Parse Chrome net-log for:
-    - master.m3u8 URL
-    - All request headers Chrome used for that URL (for reuse)
-    - Title from JW ping
-    Returns (m3u8_url, title, headers_dict)
-    """
     if not os.path.exists(netlog_path):
-        return None, "video", {}
-
+        return None, "video"
     try:
         with open(netlog_path, "r", errors="replace") as f:
             content = f.read()
     except Exception as e:
         log.error(f"  Could not read net log: {e}")
-        return None, "video", {}
+        return None, "video"
 
     m3u8_url = None
     title    = "video"
-    headers  = {}
 
-    # Find master.m3u8
     m3u8_matches = re.findall(r'https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*', content)
     for url in m3u8_matches:
         if "master.m3u8" in url:
@@ -107,7 +93,6 @@ def parse_netlog(netlog_path: str):
         m3u8_url = m3u8_matches[0]
         log.info(f"  ✅ m3u8: {m3u8_url[:80]}...")
 
-    # Find title from JW ping
     ping_matches = re.findall(r'https?://[^\s"\'\\]*jwpltx\.com[^\s"\'\\]*ping\.gif[^\s"\'\\]*', content)
     for ping_url in ping_matches:
         parsed = urlparse(ping_url)
@@ -119,23 +104,13 @@ def parse_netlog(netlog_path: str):
         pt = params.get("pt", [None])[0]
         if pt:
             title = unquote(pt)
-            log.info(f"  Title: {title}")
+            log.info(f"  Title from ping: {title}")
         break
 
-    return m3u8_url, title, headers
+    return m3u8_url, title
 
-
-# ─────────────────────────────────────────────
-#  SELENIUM — get m3u8 + download via JS fetch
-# ─────────────────────────────────────────────
 
 def get_m3u8_and_headers_via_selenium(page_url: str):
-    """
-    Open page, capture m3u8 URL, and extract request headers
-    that Chrome used (including cookies) via JS and performance entries.
-    Returns (m3u8_url, title, request_headers, selenium_driver)
-    NOTE: driver is returned OPEN so we can use it to download.
-    """
     if os.path.exists(NET_LOG_PATH):
         os.remove(NET_LOG_PATH)
 
@@ -158,98 +133,90 @@ def get_m3u8_and_headers_via_selenium(page_url: str):
     driver  = webdriver.Chrome(service=service, options=chrome_options)
     log.info("  ✅ ChromeDriver started.")
 
-    driver.get(page_url)
-    log.info("  Waiting 20s for JW Player...")
-    time.sleep(20)
-
     title = "video"
+    cookies = []
     try:
-        title = driver.title.strip() or "video"
-        log.info(f"  Page title: {title}")
-    except Exception:
-        pass
+        driver.get(page_url)
+        log.info("  Waiting 20s for JW Player...")
+        time.sleep(20)
+        try:
+            title = driver.title.strip() or "video"
+            log.info(f"  Page title: {title}")
+        except Exception:
+            pass
+        cookies = driver.get_cookies()
+        log.info(f"  Captured {len(cookies)} cookies.")
+    except Exception as e:
+        log.error(f"  Selenium error: {e}")
+    finally:
+        driver.quit()
+        log.info("  Chrome closed.")
 
-    # Get cookies from browser
-    cookies = driver.get_cookies()
-    cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-
-    driver.quit()
-    log.info("  Chrome closed. Parsing net log...")
-
-    m3u8_url, log_title, _ = parse_netlog(NET_LOG_PATH)
+    m3u8_url, log_title = parse_netlog(NET_LOG_PATH)
     if log_title != "video":
         title = log_title
 
-    # Build headers mimicking Chrome exactly
-    parsed  = urlparse(page_url)
-    origin  = f"{parsed.scheme}://{parsed.netloc}"
-    request_headers = {
+    parsed = urlparse(page_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+
+    headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
-        "Referer":          page_url,
-        "Origin":           origin,
-        "Accept":           "*/*",
-        "Accept-Language":  "en-US,en;q=0.9",
-        "Accept-Encoding":  "gzip, deflate, br",
-        "Connection":       "keep-alive",
-        "Sec-Fetch-Dest":   "empty",
-        "Sec-Fetch-Mode":   "cors",
-        "Sec-Fetch-Site":   "cross-site",
+        "Referer":         page_url,
+        "Origin":          origin,
+        "Accept":          "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection":      "keep-alive",
+        "Sec-Fetch-Dest":  "empty",
+        "Sec-Fetch-Mode":  "cors",
+        "Sec-Fetch-Site":  "cross-site",
     }
     if cookie_header:
-        request_headers["Cookie"] = cookie_header
-        log.info(f"  Added {len(cookies)} cookies to request headers.")
+        headers["Cookie"] = cookie_header
 
-    return m3u8_url, title, request_headers
+    return m3u8_url, title, headers
 
 
 # ─────────────────────────────────────────────
-#  DOWNLOAD VIA REQUESTS (same IP as Chrome)
+#  DOWNLOAD HLS SEGMENTS
 # ─────────────────────────────────────────────
 
-def parse_m3u8_segments(m3u8_content: str, base_url: str) -> list:
-    """Parse an m3u8 playlist and return list of absolute segment URLs."""
-    segments = []
-    lines    = m3u8_content.splitlines()
-
-    # If this is a master playlist, find the best stream playlist URL
+def parse_m3u8_segments(m3u8_content: str, base_url: str):
+    """Returns list of segment URLs, or a string URL if it's a master playlist."""
     if "#EXT-X-STREAM-INF" in m3u8_content:
-        best_bandwidth = 0
-        best_url       = None
+        best_bw  = 0
+        best_url = None
+        lines    = m3u8_content.splitlines()
         for i, line in enumerate(lines):
             if line.startswith("#EXT-X-STREAM-INF"):
                 bw_match = re.search(r'BANDWIDTH=(\d+)', line)
                 bw = int(bw_match.group(1)) if bw_match else 0
-                if bw >= best_bandwidth and i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    if next_line and not next_line.startswith("#"):
-                        best_bandwidth = bw
-                        best_url       = next_line
+                if bw >= best_bw and i + 1 < len(lines):
+                    nxt = lines[i + 1].strip()
+                    if nxt and not nxt.startswith("#"):
+                        best_bw  = bw
+                        best_url = nxt
         if best_url:
             if not best_url.startswith("http"):
                 best_url = base_url.rsplit("/", 1)[0] + "/" + best_url
-            return best_url  # Return URL string, not list, to signal re-fetch needed
+            return best_url  # signal to re-fetch
         return []
 
-    # Regular media playlist — extract .ts or segment URLs
-    for line in lines:
+    segments = []
+    for line in m3u8_content.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             if line.startswith("http"):
                 segments.append(line)
             else:
                 segments.append(base_url.rsplit("/", 1)[0] + "/" + line)
-
     return segments
 
 
-def download_hls_with_requests(m3u8_url: str, title: str, headers: dict) -> str | None:
-    """
-    Download HLS stream using requests (runs in same process/IP as the bot).
-    Fetches master m3u8 → media m3u8 → all .ts segments → merges with ffmpeg.
-    """
+def download_hls_with_requests(m3u8_url: str, title: str, headers: dict):
     os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
     safe_title   = re.sub(r'[\\/*?:"<>|]', "", title).strip() or "video"
     segments_dir = os.path.join(DOWNLOAD_FOLDER, f"{safe_title}_segments")
@@ -259,20 +226,17 @@ def download_hls_with_requests(m3u8_url: str, title: str, headers: dict) -> str 
     session = requests.Session()
     session.headers.update(headers)
 
-    log.info(f"  Fetching master m3u8...")
+    log.info("  Fetching master m3u8...")
     try:
         resp = session.get(m3u8_url, timeout=30)
         resp.raise_for_status()
-        master_content = resp.text
     except Exception as e:
         log.error(f"  Failed to fetch m3u8: {e}")
         return None
 
-    # Parse master → get media playlist URL
-    result = parse_m3u8_segments(master_content, m3u8_url)
+    result = parse_m3u8_segments(resp.text, m3u8_url)
 
     if isinstance(result, str):
-        # Got a media playlist URL back — fetch it
         media_url = result
         log.info(f"  Fetching media playlist: {media_url[:80]}...")
         try:
@@ -284,15 +248,14 @@ def download_hls_with_requests(m3u8_url: str, title: str, headers: dict) -> str 
             return None
     else:
         segments = result
-        media_url = m3u8_url
 
     if not segments:
-        log.error("  No segments found in playlist.")
+        log.error("  No segments found.")
         return None
 
     log.info(f"  Downloading {len(segments)} segments...")
-
     segment_files = []
+    failed = 0
     for idx, seg_url in enumerate(segments):
         seg_path = os.path.join(segments_dir, f"seg_{idx:05d}.ts")
         if os.path.exists(seg_path):
@@ -304,42 +267,29 @@ def download_hls_with_requests(m3u8_url: str, title: str, headers: dict) -> str 
             with open(seg_path, "wb") as f:
                 f.write(r.content)
             segment_files.append(seg_path)
-            if idx % 20 == 0:
-                log.info(f"  Progress: {idx}/{len(segments)} segments")
         except Exception as e:
             log.warning(f"  Segment {idx} failed: {e}")
+            failed += 1
+        if idx % 50 == 0:
+            log.info(f"  Progress: {idx}/{len(segments)} segments")
 
-    if not segment_files:
-        log.error("  No segments downloaded.")
-        return None
+    log.info(f"  Downloaded {len(segment_files)}/{len(segments)} segments ({failed} failed). Merging...")
 
-    log.info(f"  Downloaded {len(segment_files)}/{len(segments)} segments. Merging...")
-
-    # Write concat list for ffmpeg
     concat_file = os.path.join(segments_dir, "concat.txt")
     with open(concat_file, "w") as f:
         for sf in segment_files:
             f.write(f"file '{sf}'\n")
 
-    # Merge with ffmpeg
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_file,
-        "-c", "copy",
-        output_path
-    ]
-    log.info(f"  Merging with ffmpeg...")
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", output_path]
     result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Clean up segments immediately to free disk space
+    shutil.rmtree(segments_dir, ignore_errors=True)
+    log.info("  Segments cleaned up.")
 
     if result.returncode != 0:
         log.error(f"  ffmpeg merge error: {result.stderr[-500:]}")
         return None
-
-    # Cleanup segments
-    import shutil
-    shutil.rmtree(segments_dir, ignore_errors=True)
 
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     log.info(f"  ✅ Merged: {output_path} ({size_mb:.1f} MB)")
@@ -347,56 +297,9 @@ def download_hls_with_requests(m3u8_url: str, title: str, headers: dict) -> str 
 
 
 # ─────────────────────────────────────────────
-#  SPLIT WITH FFMPEG
-# ─────────────────────────────────────────────
-
-def split_video(input_path: str) -> list:
-    file_size = os.path.getsize(input_path)
-    if file_size <= PART_SIZE_BYTES:
-        log.info(f"  Single upload ({file_size/1024/1024:.1f} MB).")
-        return [input_path]
-
-    log.info(f"  {file_size/1024/1024/1024:.2f} GB — splitting...")
-
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-        capture_output=True, text=True
-    )
-    try:
-        duration = float(probe.stdout.strip())
-    except ValueError:
-        return [input_path]
-
-    num_parts     = max(2, -(-file_size // PART_SIZE_BYTES))
-    part_duration = duration / num_parts
-    base          = os.path.splitext(input_path)[0]
-    part_paths    = []
-
-    for i in range(num_parts):
-        part_path = f"{base}_part{i+1}of{num_parts}.mp4"
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(i * part_duration),
-            "-i", input_path,
-            "-t", str(part_duration),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            part_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            part_paths.append(part_path)
-            log.info(f"  Part {i+1}/{num_parts}: {os.path.getsize(part_path)/1024/1024:.1f} MB")
-        else:
-            log.error(f"  ffmpeg split error: {result.stderr[-200:]}")
-
-    os.remove(input_path)
-    return part_paths
-
-
-# ─────────────────────────────────────────────
-#  TELEGRAM UPLOAD
+#  UPLOAD WITH ONE-AT-A-TIME SPLITTING
+#  Creates one part → uploads it → deletes it → creates next part
+#  Max disk usage = original file + 1 part at a time
 # ─────────────────────────────────────────────
 
 async def upload_part(bot, local_path: str, caption: str) -> bool:
@@ -405,10 +308,10 @@ async def upload_part(bot, local_path: str, caption: str) -> bool:
     log.info(f"  Uploading {filename} ({file_size/1024/1024:.1f} MB)...")
 
     if file_size > 2 * 1024 * 1024 * 1024:
-        log.error("  Exceeds 2 GB. Skipping.")
+        log.error("  Exceeds 2 GB limit. Skipping.")
         return False
 
-    for attempt in range(1, 4):  # 3 attempts
+    for attempt in range(1, 4):
         try:
             log.info(f"  Upload attempt {attempt}/3...")
             with open(local_path, "rb") as f:
@@ -417,8 +320,8 @@ async def upload_part(bot, local_path: str, caption: str) -> bool:
                     video=f,
                     caption=caption,
                     supports_streaming=True,
-                    read_timeout=3600,   # 1 hour
-                    write_timeout=3600,  # 1 hour
+                    read_timeout=3600,
+                    write_timeout=3600,
                     connect_timeout=120,
                     pool_timeout=3600,
                 )
@@ -435,26 +338,86 @@ async def upload_part(bot, local_path: str, caption: str) -> bool:
     return False
 
 
-async def upload_video(bot, local_path: str, title: str, page_url: str) -> bool:
-    parts   = split_video(local_path)
-    total   = len(parts)
-    success = True
+async def upload_video(bot, input_path: str, title: str, page_url: str) -> bool:
+    file_size = os.path.getsize(input_path)
 
-    for idx, part_path in enumerate(parts, 1):
-        caption = (
-            f"🎬 {title}\n📦 Part {idx}/{total}"
-            if total > 1
-            else CAPTION_TEMPLATE.format(title=title, url=page_url)
-        )
+    # Small enough to upload directly
+    if file_size <= PART_SIZE_BYTES:
+        log.info(f"  Single upload ({file_size/1024/1024:.1f} MB).")
+        caption = CAPTION_TEMPLATE.format(title=title, url=page_url)
+        ok = await upload_part(bot, input_path, caption)
+        try:
+            os.remove(input_path)
+        except Exception:
+            pass
+        return ok
+
+    # Need to split — get duration first
+    log.info(f"  {file_size/1024/1024/1024:.2f} GB — will split one part at a time...")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+        capture_output=True, text=True
+    )
+    try:
+        duration = float(probe.stdout.strip())
+    except ValueError:
+        log.error("  Could not probe duration. Attempting direct upload.")
+        caption = CAPTION_TEMPLATE.format(title=title, url=page_url)
+        return await upload_part(bot, input_path, caption)
+
+    num_parts     = max(2, -(-file_size // PART_SIZE_BYTES))
+    part_duration = duration / num_parts
+    base          = os.path.splitext(input_path)[0]
+    success       = True
+
+    log.info(f"  Splitting into {num_parts} parts of ~{part_duration/60:.1f} min each.")
+
+    for i in range(num_parts):
+        part_path = f"{base}_part{i+1}of{num_parts}.mp4"
+        caption   = f"🎬 {title}\n📦 Part {i+1}/{num_parts}"
+
+        # Create this part only
+        log.info(f"  Creating part {i+1}/{num_parts}...")
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(i * part_duration),
+            "-i", input_path,
+            "-t", str(part_duration),
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            part_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log.error(f"  ffmpeg error: {result.stderr[-300:]}")
+            success = False
+            continue
+
+        part_size = os.path.getsize(part_path)
+        log.info(f"  Part {i+1}/{num_parts}: {part_size/1024/1024:.1f} MB")
+
+        # Upload this part immediately
         ok = await upload_part(bot, part_path, caption)
         if not ok:
             success = False
+
+        # Delete part right away to free disk
         try:
             os.remove(part_path)
+            log.info(f"  Deleted part {i+1} from disk.")
         except Exception:
             pass
-        if idx < total:
+
+        if i < num_parts - 1:
             await asyncio.sleep(UPLOAD_DELAY)
+
+    # Delete original file
+    try:
+        os.remove(input_path)
+        log.info("  Deleted original file from disk.")
+    except Exception:
+        pass
 
     return success
 
@@ -487,19 +450,16 @@ async def main():
         log.info(f"\n{'='*60}")
         log.info(f"Processing: {page_url}")
 
-        # 1. Get m3u8 URL + session headers from Chrome
         m3u8_url, title, headers = get_m3u8_and_headers_via_selenium(page_url)
         if not m3u8_url:
             log.error("  No m3u8 found. Skipping.")
             continue
 
-        # 2. Download HLS using same headers (same IP, same session context)
         local_path = download_hls_with_requests(m3u8_url, title, headers)
         if not local_path or not os.path.exists(local_path):
             log.error("  Download failed. Skipping.")
             continue
 
-        # 3. Upload to Telegram (split if > 1.9 GB)
         success = await upload_video(bot, local_path, title, page_url)
         if success:
             save_to_log(page_url)
