@@ -1,23 +1,19 @@
 
 #!/usr/bin/env python3
 """
-Telegram link-trigger video bot (trigger-only)
+Telegram link-trigger video bot (trigger-only, improved)
 
 What it does
 - Waits for you to send a webpage link to the bot in PRIVATE chat
+- Normalizes Kurdfilm /view/m/... links to /w/movie/<id>
 - Opens the page in headless Chrome
-- Captures the HLS playlist and browser cookies/headers
-- Prefers the final media playlist to avoid 403 errors
-- Falls back to the master playlist and chooses the best HD variant when available
+- Captures HLS playlist URLs from both page source and Chrome netlog
+- Prefers final media playlists over protected master playlists
+- Falls back to master playlist and chooses best HD variant when accessible
 - Downloads with ffmpeg without re-encoding
 - Applies a mobile-safe MP4 remux for better Telegram playback
 - Posts thumbnail + caption to your channel
 - Uploads the video as a reply to the thumbnail post
-
-What it does NOT do
-- No daily scheduler
-- No VIDEO_PAGES startup job
-- No auto-run on restart
 
 Required environment variables
 - BOT_TOKEN
@@ -99,10 +95,22 @@ def is_allowed_user(user_id: int) -> bool:
         return True
     return bool(OWNER_USER_ID and str(user_id) == OWNER_USER_ID)
 
+def normalize_input_url(url: str) -> str:
+    m = re.search(r'https?://kurdfilm\.krd/view/m/(\d+)', url, re.IGNORECASE)
+    if m:
+        return f"https://kurdfilm.krd/w/movie/{m.group(1)}"
+
+    m = re.search(r'https?://kurdfilm\.krd/w/movie/(\d+)', url, re.IGNORECASE)
+    if m:
+        return f"https://kurdfilm.krd/w/movie/{m.group(1)}"
+
+    return url
+
 def extract_urls(text: str):
     if not text:
         return []
-    return re.findall(r'https?://\S+', text)
+    raw = re.findall(r'https?://\S+', text)
+    return [normalize_input_url(u.rstrip(").,]}>")) for u in raw]
 
 def sanitize_filename(name: str) -> str:
     safe = re.sub(r'[\\/*?:"<>|]', "", name).strip()
@@ -206,7 +214,7 @@ def format_caption(details: dict) -> str:
 
 
 # -------------------------------------------------
-# SELENIUM / NETLOG
+# SELENIUM / PAGE SOURCE / NETLOG
 # -------------------------------------------------
 
 def find_player_referer(driver, page_url: str) -> str:
@@ -219,6 +227,25 @@ def find_player_referer(driver, page_url: str) -> str:
     except Exception:
         pass
     return page_url
+
+def extract_m3u8_from_html(html: str, base_url: str):
+    urls = re.findall(r'https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*', html)
+    resolved = []
+    seen = set()
+
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            resolved.append(u)
+
+    rels = re.findall(r'["\']([^"\']+\.m3u8[^"\']*)["\']', html)
+    for r in rels:
+        full = resolve_url(base_url, r)
+        if full not in seen:
+            seen.add(full)
+            resolved.append(full)
+
+    return resolved
 
 def parse_netlog_urls(netlog_path: str):
     if not os.path.exists(netlog_path):
@@ -266,6 +293,8 @@ def choose_netlog_playlists(urls):
     return media_url, master_url
 
 def get_m3u8_candidates_and_headers(page_url: str):
+    page_url = normalize_input_url(page_url)
+
     if os.path.exists(NET_LOG_PATH):
         os.remove(NET_LOG_PATH)
 
@@ -287,13 +316,24 @@ def get_m3u8_candidates_and_headers(page_url: str):
 
     cookies = []
     referer_url = page_url
+    html_urls = []
 
     try:
         driver.get(page_url)
         log.info("  Waiting 20s for JW Player...")
         time.sleep(20)
+
         cookies = driver.get_cookies()
         referer_url = find_player_referer(driver, page_url)
+
+        try:
+            html = driver.page_source or ""
+            html_urls = extract_m3u8_from_html(html, page_url)
+            if html_urls:
+                log.info(f"  Found {len(html_urls)} m3u8 URL(s) in page source.")
+        except Exception as e:
+            log.warning(f"  HTML m3u8 extraction failed: {e}")
+
         log.info(f"  Captured {len(cookies)} cookies.")
         log.info(f"  Player referer: {referer_url}")
     except Exception as e:
@@ -302,7 +342,15 @@ def get_m3u8_candidates_and_headers(page_url: str):
         driver.quit()
         log.info("  Chrome closed. Parsing net log...")
 
-    all_urls = parse_netlog_urls(NET_LOG_PATH)
+    netlog_urls = parse_netlog_urls(NET_LOG_PATH)
+
+    all_urls = []
+    seen = set()
+    for u in html_urls + netlog_urls:
+        if u not in seen:
+            seen.add(u)
+            all_urls.append(u)
+
     media_url, master_url = choose_netlog_playlists(all_urls)
 
     parsed = urlparse(referer_url)
@@ -594,6 +642,7 @@ async def upload_video(tl_client, input_path: str, title: str, reply_to: int | N
 # -------------------------------------------------
 
 async def process_movie(tg_bot, tl_client, page_url: str, app: Application | None = None, notify_chat_id: int | None = None) -> bool:
+    page_url = normalize_input_url(page_url)
     log.info(f"\n{'='*60}")
     log.info(f"Processing: {page_url}")
 
@@ -627,8 +676,12 @@ async def process_movie(tg_bot, tl_client, page_url: str, app: Application | Non
 
     local_path = download_hls_ffmpeg(chosen_url, details["title"], headers)
 
+    if not local_path and media_url and chosen_url != media_url:
+        log.warning("  Retry with browser-captured media playlist...")
+        local_path = download_hls_ffmpeg(media_url, details["title"], headers)
+
     if not local_path and master_url and chosen_url != master_url:
-        log.warning("  Variant/media download failed, retrying with master playlist...")
+        log.warning("  Retry with master playlist...")
         local_path = download_hls_ffmpeg(master_url, details["title"], headers)
 
     if not local_path:
@@ -653,6 +706,7 @@ async def process_movie(tg_bot, tl_client, page_url: str, app: Application | Non
 # -------------------------------------------------
 
 async def enqueue_link(url: str, source_chat_id: int | None = None):
+    url = normalize_input_url(url)
     key = (url, source_chat_id)
     if key in queue_seen:
         return False
