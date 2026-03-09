@@ -25,6 +25,8 @@ import requests
 from bs4 import BeautifulSoup
 import telegram
 from telegram.error import TelegramError
+from telethon import TelegramClient
+from telethon.tl.types import DocumentAttributeVideo
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -34,6 +36,8 @@ from selenium.webdriver.chrome.service import Service
 # ─────────────────────────────────────────────
 BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID   = os.environ.get("CHANNEL_ID",   "@your_channel_here")
+API_ID       = int(os.environ.get("API_ID",   "0"))   # from my.telegram.org
+API_HASH     = os.environ.get("API_HASH",  "")         # from my.telegram.org
 _pages_env  = os.environ.get("VIDEO_PAGES", "")
 VIDEO_PAGES  = [u.strip() for u in _pages_env.split(",") if u.strip()]
 
@@ -44,7 +48,7 @@ DAILY_LIMIT  = int(os.environ.get("DAILY_LIMIT", "20"))   # 0 = unlimited
 DOWNLOAD_FOLDER  = os.environ.get("DOWNLOAD_FOLDER", "/tmp/downloads")
 UPLOADED_LOG     = os.environ.get("UPLOADED_LOG",    "/tmp/uploaded_movies.txt")
 UPLOAD_DELAY     = int(os.environ.get("UPLOAD_DELAY", "5"))
-PART_SIZE_BYTES  = int(os.environ.get("PART_SIZE_MB", "1800")) * 1024 * 1024
+PART_SIZE_BYTES  = int(os.environ.get("PART_SIZE_MB", "1900")) * 1024 * 1024
 
 CHROME_BIN       = "/usr/bin/google-chrome"
 CHROMEDRIVER_BIN = "/usr/local/bin/chromedriver"
@@ -441,20 +445,21 @@ def download_hls(m3u8_url: str, title: str, headers: dict) -> str | None:
 #  TELEGRAM — post thumbnail then video reply
 # ─────────────────────────────────────────────
 
-async def post_thumbnail(bot, details: dict) -> int | None:
+async def post_thumbnail(tg_bot, details: dict) -> int | None:
+    """Post thumbnail + caption using python-telegram-bot (no size limit for photos)."""
     caption = format_caption(details)
     try:
         if details["thumbnail_url"]:
             r = requests.get(details["thumbnail_url"], timeout=15)
             r.raise_for_status()
-            msg = await bot.send_photo(
+            msg = await tg_bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=r.content,
                 caption=caption,
                 parse_mode="Markdown",
             )
         else:
-            msg = await bot.send_message(
+            msg = await tg_bot.send_message(
                 chat_id=CHANNEL_ID,
                 text=caption,
                 parse_mode="Markdown",
@@ -466,57 +471,48 @@ async def post_thumbnail(bot, details: dict) -> int | None:
         return None
 
 
-async def upload_part(bot, local_path: str, caption: str, reply_to: int | None) -> bool:
-    filename  = os.path.basename(local_path)
-    file_size = os.path.getsize(local_path)
-    log.info(f"  Uploading {filename} ({file_size/1024/1024:.1f} MB)...")
+async def upload_video(tl_client, input_path: str, title: str, reply_to: int | None) -> bool:
+    """
+    Upload video using Telethon (MTProto) — supports files up to 2 GB natively.
+    No splitting needed for files under 2 GB.
+    For files over 2 GB, splits one part at a time.
+    """
+    file_size = os.path.getsize(input_path)
+    log.info(f"  Uploading {os.path.basename(input_path)} ({file_size/1024/1024:.1f} MB) via Telethon...")
 
-    if file_size > 2 * 1024 * 1024 * 1024:
-        log.error("  Exceeds 2 GB limit. Skipping.")
+    TWO_GB = 2 * 1024 * 1024 * 1024
+
+    async def _upload_one(path: str, caption: str, reply_id: int | None) -> bool:
+        for attempt in range(1, 4):
+            try:
+                log.info(f"  Telethon upload attempt {attempt}/3: {os.path.basename(path)}")
+                await tl_client.send_file(
+                    CHANNEL_ID,
+                    path,
+                    caption=caption,
+                    reply_to=reply_id,
+                    supports_streaming=True,
+                    progress_callback=lambda c, t: log.info(f"    Upload progress: {c/t*100:.1f}%") if t and c % (50*1024*1024) < 1*1024*1024 else None,
+                )
+                log.info(f"  ✅ Uploaded: {os.path.basename(path)}")
+                return True
+            except Exception as e:
+                log.error(f"  Upload error (attempt {attempt}): {e}")
+                if attempt < 3:
+                    await asyncio.sleep(30 * attempt)
         return False
 
-    for attempt in range(1, 4):
-        try:
-            log.info(f"  Attempt {attempt}/3...")
-            with open(local_path, "rb") as f:
-                await bot.send_video(
-                    chat_id=CHANNEL_ID,
-                    video=f,
-                    caption=caption,
-                    reply_to_message_id=reply_to,
-                    supports_streaming=True,
-                    read_timeout=3600,
-                    write_timeout=3600,
-                    connect_timeout=120,
-                    pool_timeout=3600,
-                )
-            log.info(f"  ✅ Uploaded: {filename}")
-            return True
-        except TelegramError as e:
-            log.error(f"  Telegram error (attempt {attempt}): {e}")
-            if attempt < 3:
-                await asyncio.sleep(30 * attempt)
-
-    log.error(f"  ❌ All attempts failed: {filename}")
-    return False
-
-
-async def upload_video(bot, input_path: str, title: str, reply_to: int | None) -> bool:
-    """Upload video — split one part at a time to keep disk usage low."""
-    file_size = os.path.getsize(input_path)
-
-    # Small enough — upload directly
-    if file_size <= PART_SIZE_BYTES:
-        log.info(f"  Single upload ({file_size/1024/1024:.1f} MB).")
-        ok = await upload_part(bot, input_path, f"🎬 {title}", reply_to)
+    # File fits in one upload
+    if file_size <= TWO_GB:
+        ok = await _upload_one(input_path, f"🎬 {title}", reply_to)
         try:
             os.remove(input_path)
         except Exception:
             pass
         return ok
 
-    # Large file — create one part at a time, upload, delete, repeat
-    log.info(f"  {file_size/1024/1024/1024:.2f} GB — splitting one part at a time...")
+    # File > 2 GB — split one part at a time
+    log.info(f"  {file_size/1024/1024/1024:.2f} GB > 2 GB — splitting one part at a time...")
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", input_path],
@@ -525,19 +521,15 @@ async def upload_video(bot, input_path: str, title: str, reply_to: int | None) -
     try:
         duration = float(probe.stdout.strip())
     except ValueError:
-        return await upload_part(bot, input_path, f"🎬 {title}", reply_to)
+        return await _upload_one(input_path, f"🎬 {title}", reply_to)
 
     num_parts     = max(2, -(-file_size // PART_SIZE_BYTES))
     part_duration = duration / num_parts
     base          = os.path.splitext(input_path)[0]
     success       = True
 
-    log.info(f"  Splitting into {num_parts} parts of ~{part_duration/60:.0f} min each.")
-
     for i in range(num_parts):
         part_path = f"{base}_part{i+1}of{num_parts}.mp4"
-
-        # Create only this part
         log.info(f"  Creating part {i+1}/{num_parts}...")
         res = subprocess.run([
             "ffmpeg", "-y",
@@ -554,30 +546,21 @@ async def upload_video(bot, input_path: str, title: str, reply_to: int | None) -
             success = False
             continue
 
-        log.info(f"  Part {i+1}/{num_parts}: {os.path.getsize(part_path)/1024/1024:.1f} MB")
-
-        # Upload immediately
-        ok = await upload_part(bot, part_path, f"🎬 {title}\n📦 Part {i+1}/{num_parts}", reply_to)
+        log.info(f"  Part {i+1}: {os.path.getsize(part_path)/1024/1024:.1f} MB")
+        ok = await _upload_one(part_path, f"🎬 {title}\n📦 Part {i+1}/{num_parts}", reply_to)
         if not ok:
             success = False
-
-        # Delete part right away before creating the next one
         try:
             os.remove(part_path)
-            log.info(f"  Deleted part {i+1} to free disk space.")
         except Exception:
             pass
-
         if i < num_parts - 1:
             await asyncio.sleep(UPLOAD_DELAY)
 
-    # Delete original
     try:
         os.remove(input_path)
-        log.info("  Deleted original file.")
     except Exception:
         pass
-
     return success
 
 
@@ -585,7 +568,7 @@ async def upload_video(bot, input_path: str, title: str, reply_to: int | None) -
 #  PROCESS ONE MOVIE
 # ─────────────────────────────────────────────
 
-async def process_movie(bot, page_url: str) -> bool:
+async def process_movie(tg_bot, tl_client, page_url: str) -> bool:
     log.info(f"\n{'='*60}")
     log.info(f"Processing: {page_url}")
 
@@ -598,18 +581,18 @@ async def process_movie(bot, page_url: str) -> bool:
         log.error("  No m3u8 found. Skipping.")
         return False
 
-    # 3. Post thumbnail with movie details caption
-    thumb_msg_id = await post_thumbnail(bot, details)
+    # 3. Post thumbnail with movie details caption (python-telegram-bot)
+    thumb_msg_id = await post_thumbnail(tg_bot, details)
     await asyncio.sleep(2)
 
-    # 4. Download video on server (same IP as Chrome — token stays valid)
+    # 4. Download video on server
     local_path = download_hls(m3u8_url, details["title"], headers)
     if not local_path:
         log.error("  Download failed.")
         return False
 
-    # 5. Upload video as reply to thumbnail post
-    success = await upload_video(bot, local_path, details["title"], thumb_msg_id)
+    # 5. Upload video via Telethon (supports up to 2 GB)
+    success = await upload_video(tl_client, local_path, details["title"], thumb_msg_id)
 
     if success:
         save_to_log(page_url)
@@ -621,7 +604,7 @@ async def process_movie(bot, page_url: str) -> bool:
 #  DAILY JOB
 # ─────────────────────────────────────────────
 
-async def run_daily_job(bot):
+async def run_daily_job(tg_bot, tl_client):
     log.info(f"\n{'#'*60}")
     log.info(f"Daily job @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
@@ -636,7 +619,7 @@ async def run_daily_job(bot):
     success = 0
     for page_url in new_movies:
         try:
-            if await process_movie(bot, page_url):
+            if await process_movie(tg_bot, tl_client, page_url):
                 success += 1
         except Exception as e:
             log.error(f"  Error processing {page_url}: {e}")
@@ -650,12 +633,17 @@ async def run_daily_job(bot):
 # ─────────────────────────────────────────────
 
 async def scheduler():
-    bot = telegram.Bot(token=BOT_TOKEN)
+    tg_bot  = telegram.Bot(token=BOT_TOKEN)
+    # Telethon client — uses MTProto for large file uploads (up to 2 GB)
+    tl_client = TelegramClient("bot_session", API_ID, API_HASH)
+    await tl_client.start(bot_token=BOT_TOKEN)
+    log.info("Telethon client connected.")
+
     log.info(f"Bot started. Scheduled daily at {RUN_HOUR:02d}:{RUN_MINUTE:02d} UTC.")
     log.info(f"Channel: {CHANNEL_ID} | Movies queued: {len(VIDEO_PAGES)} | Daily limit: {DAILY_LIMIT}")
 
     # Run immediately on startup
-    await run_daily_job(bot)
+    await run_daily_job(tg_bot, tl_client)
 
     while True:
         now = datetime.utcnow()
@@ -666,7 +654,7 @@ async def scheduler():
             secs += 86400
         log.info(f"Next run in {secs // 3600}h {(secs % 3600) // 60}m")
         await asyncio.sleep(secs)
-        await run_daily_job(bot)
+        await run_daily_job(tg_bot, tl_client)
 
 
 # ─────────────────────────────────────────────
