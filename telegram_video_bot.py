@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Video Scraper → Telegram Uploader Bot
-Railway-ready: downloads on server, splits files > 1.9 GB, uploads all parts.
+Video → Telegram Uploader Bot (Railway-ready)
+Uses Chrome --log-net-log to reliably capture JW Player m3u8 URLs on headless servers.
 """
 
 import os
 import re
 import json
 import time
-import glob
 import asyncio
 import logging
 import subprocess
@@ -22,23 +21,24 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION  (override via env vars on Railway)
+#  CONFIGURATION  (set as env vars on Railway)
 # ─────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN",   "YOUR_BOT_TOKEN_HERE")
 CHANNEL_ID  = os.environ.get("CHANNEL_ID",  "@your_channel_here")
 
-# Comma-separated list of page URLs (set as env var on Railway)
-# e.g.  VIDEO_PAGES=https://kurdfilm.krd/w/movie/111,https://kurdfilm.krd/w/movie/222
 _pages_env  = os.environ.get("VIDEO_PAGES", "")
 VIDEO_PAGES = [u.strip() for u in _pages_env.split(",") if u.strip()]
 
 DOWNLOAD_FOLDER  = os.environ.get("DOWNLOAD_FOLDER", "/tmp/downloads")
 UPLOADED_LOG     = os.environ.get("UPLOADED_LOG",    "/tmp/uploaded_videos.txt")
-UPLOAD_DELAY     = int(os.environ.get("UPLOAD_DELAY", "5"))          # seconds between uploads
-PART_SIZE_BYTES  = int(os.environ.get("PART_SIZE_MB", "1900")) * 1024 * 1024  # default 1.9 GB
-CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "chromedriver")
+UPLOAD_DELAY     = int(os.environ.get("UPLOAD_DELAY", "5"))
+PART_SIZE_BYTES  = int(os.environ.get("PART_SIZE_MB", "1900")) * 1024 * 1024
 
 CAPTION_TEMPLATE = "🎬 {title}"
+
+CHROME_BIN       = "/usr/bin/google-chrome"
+CHROMEDRIVER_BIN = "/usr/local/bin/chromedriver"
+NET_LOG_PATH     = "/tmp/chrome_netlog.json"
 
 # ─────────────────────────────────────────────
 #  LOGGING
@@ -60,114 +60,135 @@ def load_uploaded_log():
     with open(UPLOADED_LOG) as f:
         return set(line.strip() for line in f if line.strip())
 
-
 def save_to_log(url: str):
     with open(UPLOADED_LOG, "a") as f:
         f.write(url + "\n")
 
 
 # ─────────────────────────────────────────────
-#  SELENIUM — intercept m3u8
+#  EXTRACT m3u8 FROM NET LOG
 # ─────────────────────────────────────────────
 
-def extract_m3u8_from_ping_url(ping_url: str):
-    parsed = urlparse(ping_url)
-    params = parse_qs(parsed.query)
-    mu = params.get("mu", [None])[0]
-    return unquote(mu) if mu else None
-
-
-def extract_title_from_ping_url(ping_url: str):
-    parsed = urlparse(ping_url)
-    params = parse_qs(parsed.query)
-    pt = params.get("pt", [None])[0]
-    return unquote(pt) if pt else "video"
-
-
-def get_m3u8_via_selenium(page_url: str):
+def parse_netlog_for_m3u8(netlog_path: str):
     """
-    Launch headless Chrome on the server, wait for JW Player to fire its
-    ping request, and extract the m3u8 stream URL + video title.
+    Parse Chrome's net-log JSON file and extract any .m3u8 URL.
+    Also looks for JW Player ping URLs to get the title.
+    Returns (m3u8_url, title).
     """
-    log.info(f"  Launching headless Chrome for: {page_url}")
-
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--disable-setuid-sandbox")
-    chrome_options.add_argument("--remote-debugging-port=9222")
-    chrome_options.add_argument("--window-size=1280,720")
-    chrome_options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-    chrome_options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-
-    # Explicitly set Chrome binary and ChromeDriver paths for Linux/Railway
-    chrome_bin = os.environ.get("CHROME_BIN", "/usr/bin/google-chrome")
-    driver_bin = os.environ.get("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
-    chrome_options.binary_location = chrome_bin
+    if not os.path.exists(netlog_path):
+        log.error(f"  Net log file not found: {netlog_path}")
+        return None, "video"
 
     try:
-        service = Service(executable_path=driver_bin)
-        driver  = webdriver.Chrome(service=service, options=chrome_options)
+        with open(netlog_path, "r", errors="replace") as f:
+            content = f.read()
     except Exception as e:
-        log.error(f"  ChromeDriver failed to start: {e}")
-        log.error(f"  Chrome binary: {chrome_bin}")
-        log.error(f"  ChromeDriver:  {driver_bin}")
-        return None, None
+        log.error(f"  Could not read net log: {e}")
+        return None, "video"
 
     m3u8_url = None
     title    = "video"
 
+    # Search for .m3u8 URLs in the raw text
+    m3u8_matches = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', content)
+    if m3u8_matches:
+        # Prefer master.m3u8
+        for url in m3u8_matches:
+            if "master.m3u8" in url:
+                m3u8_url = url
+                log.info(f"  ✅ Found master.m3u8: {m3u8_url[:80]}...")
+                break
+        if not m3u8_url:
+            m3u8_url = m3u8_matches[0]
+            log.info(f"  ✅ Found m3u8: {m3u8_url[:80]}...")
+
+    # Search for JW Player ping URL to get title
+    ping_matches = re.findall(r'https?://[^\s"\']*jwpltx\.com[^\s"\']*ping\.gif[^\s"\']*', content)
+    for ping_url in ping_matches:
+        parsed = urlparse(ping_url)
+        params = parse_qs(parsed.query)
+
+        # Extract m3u8 from mu= param if not found yet
+        if not m3u8_url:
+            mu = params.get("mu", [None])[0]
+            if mu:
+                m3u8_url = unquote(mu)
+                log.info(f"  ✅ m3u8 from JW ping mu= param: {m3u8_url[:80]}...")
+
+        # Extract title from pt= param
+        pt = params.get("pt", [None])[0]
+        if pt:
+            title = unquote(pt)
+            log.info(f"  Title: {title}")
+        break
+
+    return m3u8_url, title
+
+
+# ─────────────────────────────────────────────
+#  SELENIUM — open page and capture net log
+# ─────────────────────────────────────────────
+
+def get_m3u8_via_selenium(page_url: str):
+    """
+    Open page in headless Chrome with net-log enabled.
+    Parse the net log file for m3u8 URLs.
+    Returns (m3u8_url, title).
+    """
+    log.info(f"  Chrome: {CHROME_BIN} exists={os.path.exists(CHROME_BIN)}")
+    log.info(f"  ChromeDriver: {CHROMEDRIVER_BIN} exists={os.path.exists(CHROMEDRIVER_BIN)}")
+
+    # Clean up old net log
+    if os.path.exists(NET_LOG_PATH):
+        os.remove(NET_LOG_PATH)
+
+    chrome_options = Options()
+    chrome_options.binary_location = CHROME_BIN
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--window-size=1280,720")
+    chrome_options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    # Write all network activity to a JSON file — much more reliable than perf logs
+    chrome_options.add_argument(f"--log-net-log={NET_LOG_PATH}")
+    chrome_options.add_argument("--net-log-capture-mode=IncludeSocketBytes")
+
+    try:
+        service = Service(executable_path=CHROMEDRIVER_BIN)
+        driver  = webdriver.Chrome(service=service, options=chrome_options)
+        log.info("  ✅ ChromeDriver started.")
+    except Exception as e:
+        log.error(f"  ChromeDriver failed: {e}")
+        return None, None
+
+    title = "video"
     try:
         driver.get(page_url)
-        log.info("  Waiting 10s for JW Player to initialize...")
-        time.sleep(10)
+        log.info("  Page loaded. Waiting 20s for JW Player to fire requests...")
+        time.sleep(20)
 
-        logs = driver.get_log("performance")
-
-        # Primary: JW Player ping.gif with mu= param
-        for entry in logs:
-            msg     = json.loads(entry["message"])
-            method  = msg.get("message", {}).get("method", "")
-            if method != "Network.requestWillBeSent":
-                continue
-            req_url = msg["message"]["params"]["request"]["url"]
-            if "jwpltx.com" in req_url and "ping.gif" in req_url and "mu=" in req_url:
-                extracted = extract_m3u8_from_ping_url(req_url)
-                if extracted:
-                    m3u8_url = extracted
-                    title    = extract_title_from_ping_url(req_url)
-                    log.info(f"  ✅ m3u8 found via JW ping: {m3u8_url[:80]}...")
-                    log.info(f"  Title: {title}")
-                    break
-
-        # Fallback: any .m3u8 network request
-        if not m3u8_url:
-            for entry in logs:
-                msg    = json.loads(entry["message"])
-                method = msg.get("message", {}).get("method", "")
-                if method != "Network.requestWillBeSent":
-                    continue
-                req_url = msg["message"]["params"]["request"]["url"]
-                if ".m3u8" in req_url:
-                    m3u8_url = req_url
-                    log.info(f"  ✅ m3u8 found via fallback: {m3u8_url[:80]}...")
-                    break
-
-        if title == "video":
-            try:
-                title = driver.title.strip() or "video"
-            except Exception:
-                pass
+        # Try to get title from page
+        try:
+            title = driver.title.strip() or "video"
+            log.info(f"  Page title: {title}")
+        except Exception:
+            pass
 
     except Exception as e:
-        log.error(f"  Selenium error: {e}")
+        log.error(f"  Selenium error loading page: {e}")
     finally:
         driver.quit()
+        log.info("  Chrome closed. Parsing net log...")
+
+    # Parse the net log file
+    m3u8_url, log_title = parse_netlog_for_m3u8(NET_LOG_PATH)
+    if log_title != "video":
+        title = log_title
 
     return m3u8_url, title
 
@@ -180,8 +201,7 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 
 
-def download_m3u8(m3u8_url: str, title: str) -> str | None:
-    """Download HLS stream with yt-dlp directly on the server."""
+def download_m3u8(m3u8_url: str, title: str):
     os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
     safe_title      = sanitize_filename(title) or "video"
     output_template = os.path.join(DOWNLOAD_FOLDER, f"{safe_title}.%(ext)s")
@@ -196,19 +216,16 @@ def download_m3u8(m3u8_url: str, title: str) -> str | None:
         },
     }
 
-    log.info(f"  Downloading with yt-dlp on server...")
+    log.info(f"  Downloading: {title}")
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([m3u8_url])
 
-        # Locate downloaded file
         for f in os.listdir(DOWNLOAD_FOLDER):
             full = os.path.join(DOWNLOAD_FOLDER, f)
             if safe_title in f and f.endswith(".mp4"):
-                log.info(f"  Downloaded: {full} ({os.path.getsize(full)/1024/1024:.1f} MB)")
+                log.info(f"  ✅ Downloaded: {full} ({os.path.getsize(full)/1024/1024:.1f} MB)")
                 return full
-
-        # Broader search
         for f in os.listdir(DOWNLOAD_FOLDER):
             full = os.path.join(DOWNLOAD_FOLDER, f)
             if safe_title[:10] in f:
@@ -224,20 +241,14 @@ def download_m3u8(m3u8_url: str, title: str) -> str | None:
 #  SPLIT WITH FFMPEG
 # ─────────────────────────────────────────────
 
-def split_video(input_path: str) -> list[str]:
-    """
-    Split a video into parts of PART_SIZE_BYTES using ffmpeg (stream copy, no re-encode).
-    Returns a list of part file paths in order.
-    If the file is small enough, returns [input_path] unchanged.
-    """
+def split_video(input_path: str) -> list:
     file_size = os.path.getsize(input_path)
     if file_size <= PART_SIZE_BYTES:
-        log.info(f"  File fits in one part ({file_size/1024/1024:.1f} MB). No split needed.")
+        log.info(f"  Single upload ({file_size/1024/1024:.1f} MB).")
         return [input_path]
 
-    log.info(f"  File is {file_size/1024/1024/1024:.2f} GB — splitting into ~{PART_SIZE_BYTES/1024/1024/1024:.1f} GB parts...")
+    log.info(f"  {file_size/1024/1024/1024:.2f} GB — splitting into parts...")
 
-    # Get video duration in seconds
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", input_path],
@@ -246,39 +257,35 @@ def split_video(input_path: str) -> list[str]:
     try:
         duration = float(probe.stdout.strip())
     except ValueError:
-        log.error("  Could not probe video duration. Uploading as-is.")
+        log.error("  Could not get duration. Uploading as-is.")
         return [input_path]
 
-    # Estimate how many parts needed
-    num_parts   = max(2, -(-file_size // PART_SIZE_BYTES))  # ceiling division
+    num_parts     = max(2, -(-file_size // PART_SIZE_BYTES))
     part_duration = duration / num_parts
-
-    base        = os.path.splitext(input_path)[0]
-    part_paths  = []
+    base          = os.path.splitext(input_path)[0]
+    part_paths    = []
 
     for i in range(num_parts):
-        start      = i * part_duration
-        part_path  = f"{base}_part{i+1}of{num_parts}.mp4"
+        start     = i * part_duration
+        part_path = f"{base}_part{i+1}of{num_parts}.mp4"
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(start),
             "-i", input_path,
             "-t", str(part_duration),
-            "-c", "copy",           # stream copy — fast, no quality loss
+            "-c", "copy",
             "-avoid_negative_ts", "make_zero",
             part_path
         ]
         log.info(f"  Creating part {i+1}/{num_parts}...")
         result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            log.error(f"  ffmpeg error: {result.stderr[-300:]}")
-        else:
+        if result.returncode == 0:
             part_paths.append(part_path)
             log.info(f"  Part {i+1}: {os.path.getsize(part_path)/1024/1024:.1f} MB")
+        else:
+            log.error(f"  ffmpeg error: {result.stderr[-300:]}")
 
-    # Remove original large file to free space
     os.remove(input_path)
-    log.info(f"  Removed original file to free disk space.")
     return part_paths
 
 
@@ -287,13 +294,12 @@ def split_video(input_path: str) -> list[str]:
 # ─────────────────────────────────────────────
 
 async def upload_part(bot, local_path: str, caption: str) -> bool:
-    """Upload a single file to Telegram."""
     filename  = os.path.basename(local_path)
     file_size = os.path.getsize(local_path)
     log.info(f"  Uploading {filename} ({file_size/1024/1024:.1f} MB)...")
 
     if file_size > 2 * 1024 * 1024 * 1024:
-        log.error(f"  Part exceeds 2 GB Telegram limit ({file_size/1024**3:.2f} GB). Skipping.")
+        log.error("  Part exceeds 2 GB limit. Skipping.")
         return False
 
     try:
@@ -315,29 +321,24 @@ async def upload_part(bot, local_path: str, caption: str) -> bool:
 
 
 async def upload_video(bot, local_path: str, title: str, page_url: str) -> bool:
-    """Split if needed, then upload all parts."""
     parts   = split_video(local_path)
     total   = len(parts)
     success = True
 
     for idx, part_path in enumerate(parts, 1):
-        if total > 1:
-            caption = f"🎬 {title}\n📦 Part {idx}/{total}"
-        else:
-            caption = CAPTION_TEMPLATE.format(title=title, url=page_url)
-
+        caption = (
+            f"🎬 {title}\n📦 Part {idx}/{total}"
+            if total > 1
+            else CAPTION_TEMPLATE.format(title=title, url=page_url)
+        )
         ok = await upload_part(bot, part_path, caption)
         if not ok:
             success = False
-
-        # Clean up part after upload
         try:
             os.remove(part_path)
         except Exception:
             pass
-
         if idx < total:
-            log.info(f"  Waiting {UPLOAD_DELAY}s before next part...")
             await asyncio.sleep(UPLOAD_DELAY)
 
     return success
@@ -349,18 +350,17 @@ async def upload_video(bot, local_path: str, title: str, page_url: str) -> bool:
 
 async def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ Set BOT_TOKEN as an environment variable on Railway.")
+        print("❌ Set BOT_TOKEN env var on Railway.")
         return
     if CHANNEL_ID == "@your_channel_here":
-        print("❌ Set CHANNEL_ID as an environment variable on Railway.")
+        print("❌ Set CHANNEL_ID env var on Railway.")
         return
     if not VIDEO_PAGES:
-        print("❌ Set VIDEO_PAGES as a comma-separated env var on Railway.")
+        print("❌ Set VIDEO_PAGES env var on Railway.")
         return
 
-    log.info(f"Bot starting. {len(VIDEO_PAGES)} page(s) to process.")
     uploaded = load_uploaded_log()
-    log.info(f"Already uploaded: {len(uploaded)} page(s).")
+    log.info(f"Bot starting. {len(VIDEO_PAGES)} page(s) queued, {len(uploaded)} already done.")
 
     bot = telegram.Bot(token=BOT_TOKEN)
 
@@ -372,31 +372,23 @@ async def main():
         log.info(f"\n{'='*60}")
         log.info(f"Processing: {page_url}")
 
-        # 1. Intercept m3u8
         m3u8_url, title = get_m3u8_via_selenium(page_url)
         if not m3u8_url:
             log.error("  No m3u8 found. Skipping.")
             continue
 
-        # 2. Download on server
         local_path = download_m3u8(m3u8_url, title)
         if not local_path or not os.path.exists(local_path):
             log.error("  Download failed. Skipping.")
             continue
 
-        # 3. Upload (with auto-split if > 1.9 GB)
         success = await upload_video(bot, local_path, title, page_url)
-
         if success:
             save_to_log(page_url)
-            log.info(f"  ✅ Done: {page_url}")
-        else:
-            log.error(f"  ❌ Upload failed: {page_url}")
 
-        log.info(f"  Waiting {UPLOAD_DELAY}s before next video...")
         await asyncio.sleep(UPLOAD_DELAY)
 
-    log.info("\n✅ All videos processed!")
+    log.info("\n✅ All done!")
 
 
 if __name__ == "__main__":
