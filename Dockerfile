@@ -50,6 +50,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY telegram_video_bot.py .
+COPY bot.py .
 
-CMD ["python", "telegram_video_bot.py"]
+
+CMD ["python", "bot.py"]
