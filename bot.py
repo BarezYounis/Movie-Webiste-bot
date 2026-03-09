@@ -31,6 +31,8 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
+TL_CHANNEL = None  # resolved at startup
+
 # ─────────────────────────────────────────────
 #  CONFIGURATION  (set as env vars on Railway)
 # ─────────────────────────────────────────────
@@ -487,7 +489,7 @@ async def upload_video(tl_client, input_path: str, title: str, reply_to: int | N
             try:
                 log.info(f"  Telethon upload attempt {attempt}/3: {os.path.basename(path)}")
                 await tl_client.send_file(
-                    CHANNEL_ID,
+                    TL_CHANNEL,
                     path,
                     caption=caption,
                     reply_to=reply_id,
@@ -638,6 +640,20 @@ async def scheduler():
     tl_client = TelegramClient("bot_session", API_ID, API_HASH)
     await tl_client.start(bot_token=BOT_TOKEN)
     log.info("Telethon client connected.")
+
+    # Resolve channel entity once at startup
+    global TL_CHANNEL
+    try:
+        # Strip -100 prefix if present for Telethon peer resolution
+        chan = CHANNEL_ID
+        if isinstance(chan, str) and chan.lstrip("-").isdigit():
+            chan = int(chan)
+        TL_CHANNEL = await tl_client.get_entity(chan)
+        log.info(f"Resolved channel: {TL_CHANNEL.id}")
+    except Exception as e:
+        log.error(f"Could not resolve channel: {e}")
+        TL_CHANNEL = int(str(CHANNEL_ID).replace("-100", "").replace("-", ""))
+        log.info(f"Using raw channel ID: {TL_CHANNEL}")
 
     log.info(f"Bot started. Scheduled daily at {RUN_HOUR:02d}:{RUN_MINUTE:02d} UTC.")
     log.info(f"Channel: {CHANNEL_ID} | Movies queued: {len(VIDEO_PAGES)} | Daily limit: {DAILY_LIMIT}")
